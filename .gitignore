@@ -1,0 +1,53 @@
+# macOS / editor
+.DS_Store
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Local environments
+.venv/
+.venv-*/
+venv/
+.env
+
+# Apple Swift build artifacts (rebuildable)
+apple/BallVisionHelper/.build/
+
+# Runtime logs/databases (generated)
+benchmarks.log
+data/logs/*.csv
+data/logs/*.db
+data/logs/*.sqlite
+data/logs/*.sqlite3
+data/logs/*.sqlite3-*
+data/logs/*.jsonl
+data/benchmarks/*.json
+data/metrics/*.json
+
+# Raw capture media and temporary smoke frames (very large)
+data/identity/raw_video/
+data/identity/smoke_frames/
+
+# Keep learned verifier models + metadata, ignore other heavy identity artifacts by default
+data/identity/*
+!data/identity/*.onnx
+!data/identity/*.onnx.json
+
+# Training/evaluation datasets (very large)
+datasets/
+
+# Training runs (large). Keep only the runtime detector you currently use.
+runs/
+!runs/custom_ball/
+runs/custom_ball/*
+!runs/custom_ball/ball_yolo26s_identitymix_v2/
+runs/custom_ball/ball_yolo26s_identitymix_v2/*
+!runs/custom_ball/ball_yolo26s_identitymix_v2/weights/
+runs/custom_ball/ball_yolo26s_identitymix_v2/weights/*
+!runs/custom_ball/ball_yolo26s_identitymix_v2/weights/best.onnx

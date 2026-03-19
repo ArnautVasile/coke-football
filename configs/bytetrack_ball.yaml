@@ -1,0 +1,11 @@
+tracker_type: bytetrack
+
+# Keep low-confidence sports-ball detections alive for association.
+track_high_thresh: 0.12
+track_low_thresh: 0.04
+new_track_thresh: 0.10
+
+# Slightly longer memory helps with brief occlusions/blur.
+track_buffer: 70
+match_thresh: 0.82
+fuse_score: true

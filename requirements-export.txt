@@ -1,0 +1,5 @@
+-r requirements-yolo.txt
+numpy>=1.26.0,<=2.3.5
+onnx>=1.17.0
+onnxruntime>=1.21.0
+coremltools>=8.1; platform_system == "Darwin" and python_version < "3.14"

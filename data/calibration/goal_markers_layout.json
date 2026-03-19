@@ -1,0 +1,62 @@
+{
+  "dictionary_name": "DICT_6X6_50",
+  "marker_length_mm": 80.0,
+  "goal_width_m": 7.32,
+  "goal_height_m": 2.44,
+  "markers": [
+    {
+      "marker_id": 10,
+      "name": "top-left",
+      "center_m": [
+        0.18,
+        0.16,
+        0.0
+      ]
+    },
+    {
+      "marker_id": 11,
+      "name": "top-right",
+      "center_m": [
+        7.14,
+        0.16,
+        0.0
+      ]
+    },
+    {
+      "marker_id": 12,
+      "name": "mid-left",
+      "center_m": [
+        0.18,
+        1.22,
+        0.0
+      ]
+    },
+    {
+      "marker_id": 13,
+      "name": "mid-right",
+      "center_m": [
+        7.14,
+        1.22,
+        0.0
+      ]
+    },
+    {
+      "marker_id": 14,
+      "name": "bottom-left",
+      "center_m": [
+        0.18,
+        2.28,
+        0.0
+      ]
+    },
+    {
+      "marker_id": 15,
+      "name": "bottom-right",
+      "center_m": [
+        7.14,
+        2.28,
+        0.0
+      ]
+    }
+  ]
+}

@@ -1,0 +1,2 @@
+format,export_ok,export_path,benchmark_ok, ,Format,Status❔,Size (MB),metrics/mAP50-95(B),Inference time (ms/im),FPS
+onnx,True,yolo26n.onnx,True,1,ONNX,✅,9.5,0.6881,17.97,55.65

@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "type": "ball_identity_onnx",
+  "input_name": "input",
+  "input_size": 128,
+  "threshold": 0.32907581329345703,
+  "probability_threshold": 0.670924186706543,
+  "training_device": "cpu",
+  "validation_accuracy": 0.9404761904761905,
+  "validation_precision": 0.8333333333333334,
+  "validation_recall": 0.9523809523809523,
+  "positive_count": 420,
+  "negative_count": 1260,
+  "train_examples": 1344,
+  "val_examples": 336
+}

@@ -1,0 +1,28 @@
+{
+  "created_at": "2026-03-13T15:13:22.633312+00:00",
+  "corners_px": [
+    [
+      504.0,
+      115.0
+    ],
+    [
+      1287.0,
+      170.0
+    ],
+    [
+      1228.0,
+      617.0
+    ],
+    [
+      495.0,
+      586.0
+    ]
+  ],
+  "reference_size": [
+    1920,
+    1080
+  ],
+  "goal_width_m": 7.32,
+  "goal_height_m": 2.44,
+  "reference_frame_path": "data/calibration/reference_frame.jpg"
+}

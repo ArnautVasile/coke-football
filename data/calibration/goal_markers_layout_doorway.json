@@ -1,0 +1,67 @@
+{
+  "dictionary_name": "DICT_6X6_50",
+  "marker_length_mm": 80.0,
+  "goal_width_m": 1.38,
+  "goal_height_m": 2.11,
+  "scoring_plane_depth_m": 0.1,
+  "opening_inset_left_m": 0.1,
+  "opening_inset_right_m": 0.1,
+  "opening_inset_top_m": 0.1,
+  "opening_inset_bottom_m": 0.0,
+  "markers": [
+    {
+      "marker_id": 10,
+      "name": "top-left",
+      "center_m": [
+        0.055,
+        0.055,
+        0.0
+      ]
+    },
+    {
+      "marker_id": 11,
+      "name": "top-right",
+      "center_m": [
+        1.325,
+        0.055,
+        0.0
+      ]
+    },
+    {
+      "marker_id": 12,
+      "name": "mid-left",
+      "center_m": [
+        0.055,
+        0.895,
+        0.0
+      ]
+    },
+    {
+      "marker_id": 13,
+      "name": "mid-right",
+      "center_m": [
+        1.325,
+        0.895,
+        0.0
+      ]
+    },
+    {
+      "marker_id": 14,
+      "name": "bottom-left",
+      "center_m": [
+        0.055,
+        2.055,
+        0.0
+      ]
+    },
+    {
+      "marker_id": 15,
+      "name": "bottom-right",
+      "center_m": [
+        1.325,
+        2.055,
+        0.0
+      ]
+    }
+  ]
+}
