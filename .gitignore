@@ -43,7 +43,7 @@ data/identity/*
 datasets/
 
 # Training runs (large). Keep only the runtime detector you currently use.
-runs/
+runs/*
 !runs/custom_ball/
 runs/custom_ball/*
 !runs/custom_ball/ball_yolo26s_identitymix_v2/
