@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import cv2
 import numpy as np
@@ -9,6 +10,17 @@ import numpy as np
 from .camera_intrinsics import CameraIntrinsics, scaled_camera_matrix
 from .charuco import create_dictionary
 from .goal_markers import GoalMarkerLayout
+
+
+@dataclass
+class GoalPoseRuntime:
+    dictionary: Any
+    board: Any
+    detector_params: Any
+    detector: Any
+
+
+_GOAL_POSE_RUNTIME_CACHE: dict[tuple[Any, ...], GoalPoseRuntime] = {}
 
 
 @dataclass
@@ -75,17 +87,59 @@ def create_marker_detector():
     return params
 
 
-def detect_goal_markers(frame_bgr: np.ndarray, layout: GoalMarkerLayout, intrinsics: CameraIntrinsics):
+def goal_pose_cache_key(layout: GoalMarkerLayout) -> tuple[Any, ...]:
+    marker_key = tuple(
+        (
+            int(m.marker_id),
+            round(float(m.center_m[0]), 6),
+            round(float(m.center_m[1]), 6),
+            round(float(m.center_m[2]), 6),
+        )
+        for m in sorted(layout.markers, key=lambda x: int(x.marker_id))
+    )
+    return (
+        str(layout.dictionary_name),
+        round(float(layout.marker_length_m), 6),
+        round(float(layout.goal_width_m), 6),
+        round(float(layout.goal_height_m), 6),
+        round(float(layout.scoring_plane_depth_m), 6),
+        round(float(layout.opening_inset_left_m), 6),
+        round(float(layout.opening_inset_right_m), 6),
+        round(float(layout.opening_inset_top_m), 6),
+        round(float(layout.opening_inset_bottom_m), 6),
+        marker_key,
+    )
+
+
+def goal_pose_runtime(layout: GoalMarkerLayout) -> GoalPoseRuntime:
+    key = goal_pose_cache_key(layout)
+    runtime = _GOAL_POSE_RUNTIME_CACHE.get(key)
+    if runtime is not None:
+        return runtime
+
     dictionary = create_dictionary(layout.dictionary_name)
-    params = create_marker_detector()
-    detector = cv2.aruco.ArucoDetector(dictionary, params)
-    marker_corners, marker_ids, _rejected = detector.detectMarkers(frame_bgr)
+    detector_params = create_marker_detector()
+    detector = cv2.aruco.ArucoDetector(dictionary, detector_params)
+    board = create_goal_board(layout)
+    runtime = GoalPoseRuntime(
+        dictionary=dictionary,
+        board=board,
+        detector_params=detector_params,
+        detector=detector,
+    )
+    _GOAL_POSE_RUNTIME_CACHE[key] = runtime
+    return runtime
+
+
+def detect_goal_markers(frame_bgr: np.ndarray, layout: GoalMarkerLayout, intrinsics: CameraIntrinsics):
+    runtime = goal_pose_runtime(layout)
+    marker_corners, marker_ids, _rejected = runtime.detector.detectMarkers(frame_bgr)
     if marker_ids is None or len(marker_ids) == 0:
         return [], None
 
     h, w = frame_bgr.shape[:2]
     camera_matrix = scaled_camera_matrix(intrinsics, (w, h))
-    board = create_goal_board(layout)
+    board = runtime.board
     raw_corners = list(marker_corners)
     raw_ids = marker_ids.copy()
     try:
@@ -97,7 +151,7 @@ def detect_goal_markers(frame_bgr: np.ndarray, layout: GoalMarkerLayout, intrins
             _rejected,
             cameraMatrix=camera_matrix,
             distCoeffs=intrinsics.dist_coeffs,
-            parameters=params,
+            parameters=runtime.detector_params,
         )
     except cv2.error:
         pass
@@ -207,7 +261,7 @@ def solve_goal_pose(
             ),
         )
 
-    board = create_goal_board(layout)
+    board = goal_pose_runtime(layout).board
     obj_points, img_points = board.matchImagePoints(marker_corners, marker_ids)
     obj_points = np.asarray(obj_points, dtype=np.float32).reshape(-1, 3)
     img_points = np.asarray(img_points, dtype=np.float32).reshape(-1, 2)

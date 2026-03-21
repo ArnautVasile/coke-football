@@ -138,6 +138,8 @@ class ImpactDetector:
         min_displacement_px: float = 90.0,
         enable_entry_event: bool = True,
         min_entry_speed_px_s: float = 35.0,
+        entry_confirm_frames: int = 1,
+        allow_entry_fallbacks: bool = True,
         rearm_outside_ratio: float = 0.60,
         rearm_camera_margin_m: float = 0.14,
         rearm_miss_seconds: float = 0.75,
@@ -152,6 +154,8 @@ class ImpactDetector:
         self.min_displacement_px = max(8.0, float(min_displacement_px))
         self.enable_entry_event = bool(enable_entry_event)
         self.min_entry_speed_px_s = max(0.0, float(min_entry_speed_px_s))
+        self.entry_confirm_frames = max(1, int(entry_confirm_frames))
+        self.allow_entry_fallbacks = bool(allow_entry_fallbacks)
         self.rearm_outside_ratio = max(0.10, float(rearm_outside_ratio))
         self.rearm_camera_margin_m = max(0.01, float(rearm_camera_margin_m))
         self.rearm_miss_seconds = max(0.0, float(rearm_miss_seconds))
@@ -166,12 +170,32 @@ class ImpactDetector:
         # on the camera side of the plane so we can still score one entry if
         # the exact crossing frame is missed.
         self.last_camera_side_time = -1e9
+        self.last_camera_side_center: np.ndarray | None = None
+        self.pending_entry_active = False
+        self.pending_entry_count = 0
+        self.pending_entry_point_xy: tuple[int, int] | None = None
+        self.pending_entry_timestamp = 0.0
+        self.pending_entry_frame_index = 0
+        self.pending_entry_speed = 0.0
+        self.pending_entry_last_seen_time = 0.0
+        self.pending_entry_missing_grace_s = max(0.08, float(self.max_dt_s) * 2.0)
 
     def reset_history(self) -> None:
         self.history.clear()
         self.event_latched = False
         self.last_seen_time = 0.0
         self.last_camera_side_time = -1e9
+        self.last_camera_side_center = None
+        self._clear_pending_entry()
+
+    def _clear_pending_entry(self) -> None:
+        self.pending_entry_active = False
+        self.pending_entry_count = 0
+        self.pending_entry_point_xy = None
+        self.pending_entry_timestamp = 0.0
+        self.pending_entry_frame_index = 0
+        self.pending_entry_speed = 0.0
+        self.pending_entry_last_seen_time = 0.0
 
     def _release_latch_if_ready(
         self,
@@ -256,6 +280,9 @@ class ImpactDetector:
                 ball_radius_m=ball_radius_m,
                 plane_contact_tolerance_m=plane_contact_tolerance_m,
             )
+            if self.pending_entry_active:
+                if (now_s - float(self.pending_entry_last_seen_time)) > float(self.pending_entry_missing_grace_s):
+                    self._clear_pending_entry()
             return None
 
         center = np.asarray(center_px, dtype=np.float32)
@@ -304,6 +331,7 @@ class ImpactDetector:
                 camera_side_margin = max(0.01, float(ball_radius_m) * 0.20)
                 if oriented_d2 >= camera_side_margin:
                     self.last_camera_side_time = now_s
+                    self.last_camera_side_center = center.copy()
 
         if now_s - self.last_event_time < self.cooldown_s:
             return None
@@ -327,7 +355,81 @@ class ImpactDetector:
                 plane_margin = max(0.02, float(ball_radius_m) + max(0.0, float(plane_contact_tolerance_m)))
                 if abs(float(plane_signed_distance_m)) <= plane_margin:
                     return center_px
-            return center_px
+            # If we're already deep through the plane (rebound/late recovery),
+            # keep the geometric crossing/default point to avoid plotting hits
+            # at the later rebound location.
+            return default_xy
+
+        def emit_entry_event(
+            *,
+            event_point_xy: tuple[int, int],
+            event_timestamp_s: float,
+            event_frame_index: int,
+            event_speed: float,
+        ) -> ImpactEvent:
+            nx, ny = project_event_point(event_point_xy)
+            nx = float(np.clip(nx, 0.0, 1.0))
+            ny = float(np.clip(ny, 0.0, 1.0))
+            mx = nx * self.goal_width_m
+            my = ny * self.goal_height_m
+            self.last_event_time = now_s
+            self.event_latched = True
+            self.history.clear()
+            self.last_camera_side_time = -1e9
+            self.last_camera_side_center = None
+            self._clear_pending_entry()
+            return ImpactEvent(
+                timestamp=event_timestamp_s,
+                frame_index=event_frame_index,
+                event_type="entry",
+                pixel_point=event_point_xy,
+                normalized_point=(nx, ny),
+                meters_point=(mx, my),
+                speed_before=event_speed,
+                speed_after=event_speed,
+                angle_change_deg=0.0,
+            )
+
+        def arm_entry_confirmation(
+            *,
+            event_point_xy: tuple[int, int],
+            event_timestamp_s: float,
+            event_frame_index: int,
+            event_speed: float,
+        ) -> ImpactEvent | None:
+            if self.entry_confirm_frames <= 1:
+                return emit_entry_event(
+                    event_point_xy=event_point_xy,
+                    event_timestamp_s=event_timestamp_s,
+                    event_frame_index=event_frame_index,
+                    event_speed=event_speed,
+                )
+            if not self.pending_entry_active:
+                self.pending_entry_active = True
+                self.pending_entry_count = 1
+                self.pending_entry_point_xy = event_point_xy
+                self.pending_entry_timestamp = float(event_timestamp_s)
+                self.pending_entry_frame_index = int(event_frame_index)
+                self.pending_entry_speed = float(event_speed)
+                self.pending_entry_last_seen_time = float(now_s)
+            return None
+
+        if self.pending_entry_active:
+            if not cur_inside:
+                self._clear_pending_entry()
+            else:
+                self.pending_entry_count += 1
+                self.pending_entry_last_seen_time = float(now_s)
+                if self.pending_entry_count >= max(1, int(self.entry_confirm_frames)):
+                    if self.pending_entry_point_xy is None:
+                        self._clear_pending_entry()
+                    else:
+                        return emit_entry_event(
+                            event_point_xy=self.pending_entry_point_xy,
+                            event_timestamp_s=self.pending_entry_timestamp,
+                            event_frame_index=self.pending_entry_frame_index,
+                            event_speed=self.pending_entry_speed,
+                        )
 
         if self.enable_entry_event and (not prev_inside) and cur_inside and entry_speed >= self.min_entry_speed_px_s:
             if not self._plane_contact_ok(d1, d2, ball_radius_m, plane_contact_tolerance_m):
@@ -340,31 +442,17 @@ class ImpactDetector:
                 entry_point_xy = (int(entry_point[0]), int(entry_point[1]))
 
             event_point_xy = entry_display_point(entry_point_xy)
-            nx, ny = project_event_point(event_point_xy)
-            nx = float(np.clip(nx, 0.0, 1.0))
-            ny = float(np.clip(ny, 0.0, 1.0))
-            mx = nx * self.goal_width_m
-            my = ny * self.goal_height_m
-            self.last_event_time = now_s
-            self.event_latched = True
-            self.history.clear()
-            self.last_camera_side_time = -1e9
-            return ImpactEvent(
-                timestamp=now_s,
-                frame_index=frame_index,
-                event_type="entry",
-                pixel_point=event_point_xy,
-                normalized_point=(nx, ny),
-                meters_point=(mx, my),
-                speed_before=entry_speed,
-                speed_after=entry_speed,
-                angle_change_deg=0.0,
+            return arm_entry_confirmation(
+                event_point_xy=event_point_xy,
+                event_timestamp_s=now_s,
+                event_frame_index=frame_index,
+                event_speed=entry_speed,
             )
 
         # Fallback for partial-visibility setups:
         # if the ball first appears already inside the goal polygon, infer an entry event
         # only when it is near the edge and moving inward.
-        if self.enable_entry_event and prev_inside and cur_inside and entry_speed >= self.min_entry_speed_px_s:
+        if self.allow_entry_fallbacks and self.enable_entry_event and prev_inside and cur_inside and entry_speed >= self.min_entry_speed_px_s:
             poly = goal_corners.astype(np.float32)
             signed1 = float(cv2.pointPolygonTest(poly, (float(p1[0]), float(p1[1])), True))
             signed2 = float(cv2.pointPolygonTest(poly, (float(p2[0]), float(p2[1])), True))
@@ -379,31 +467,19 @@ class ImpactDetector:
                     edge_point = closest_point_on_polygon(p1, poly)
                     entry_point_xy = (int(edge_point[0]), int(edge_point[1]))
                     event_point_xy = entry_display_point(entry_point_xy)
-                    nx, ny = project_event_point(event_point_xy)
-                    nx = float(np.clip(nx, 0.0, 1.0))
-                    ny = float(np.clip(ny, 0.0, 1.0))
-                    mx = nx * self.goal_width_m
-                    my = ny * self.goal_height_m
-                    self.last_event_time = now_s
-                    self.event_latched = True
-                    self.history.clear()
-                    self.last_camera_side_time = -1e9
-                    return ImpactEvent(
-                        timestamp=now_s,
-                        frame_index=frame_index,
-                        event_type="entry",
-                        pixel_point=event_point_xy,
-                        normalized_point=(nx, ny),
-                        meters_point=(mx, my),
-                        speed_before=entry_speed,
-                        speed_after=entry_speed,
-                        angle_change_deg=0.0,
+                    return arm_entry_confirmation(
+                        event_point_xy=event_point_xy,
+                        event_timestamp_s=now_s,
+                        event_frame_index=frame_index,
+                        event_speed=entry_speed,
                     )
 
         # Marker-based 3D gating can be noisy by a few frames, so keep a
         # plane-aware fallback when the ball is clearly inside the opening and
         # has just reached the goal plane.
         if (
+            self.allow_entry_fallbacks
+            and
             self.enable_entry_event
             and cur_inside
             and entry_speed >= self.min_entry_speed_px_s
@@ -425,25 +501,11 @@ class ImpactDetector:
                 edge_point = closest_point_on_polygon(p2, goal_corners.astype(np.float32))
                 entry_point_xy = (int(edge_point[0]), int(edge_point[1]))
                 event_point_xy = entry_display_point(entry_point_xy)
-                nx, ny = project_event_point(event_point_xy)
-                nx = float(np.clip(nx, 0.0, 1.0))
-                ny = float(np.clip(ny, 0.0, 1.0))
-                mx = nx * self.goal_width_m
-                my = ny * self.goal_height_m
-                self.last_event_time = now_s
-                self.event_latched = True
-                self.history.clear()
-                self.last_camera_side_time = -1e9
-                return ImpactEvent(
-                    timestamp=now_s,
-                    frame_index=frame_index,
-                    event_type="entry",
-                    pixel_point=event_point_xy,
-                    normalized_point=(nx, ny),
-                    meters_point=(mx, my),
-                    speed_before=entry_speed,
-                    speed_after=entry_speed,
-                    angle_change_deg=0.0,
+                return arm_entry_confirmation(
+                    event_point_xy=event_point_xy,
+                    event_timestamp_s=now_s,
+                    event_frame_index=frame_index,
+                    event_speed=entry_speed,
                 )
 
         # Recovery fallback for detector/pose dropouts:
@@ -451,6 +513,8 @@ class ImpactDetector:
         # through the goal plane and we saw it on the camera side shortly
         # before, emit a single entry event.
         if (
+            self.allow_entry_fallbacks
+            and
             self.enable_entry_event
             and cur_inside
             and oriented_d2 is not None
@@ -463,26 +527,20 @@ class ImpactDetector:
             centroid = np.mean(goal_corners.astype(np.float32), axis=0)
             moving_not_away = float(np.dot((p2 - p1), (centroid - p1))) > -0.20 * max(entry_speed, 1.0)
             if recently_camera_side and through_surface_now and moving_not_away:
-                event_point_xy = entry_display_point(center_px)
-                nx, ny = project_event_point(event_point_xy)
-                nx = float(np.clip(nx, 0.0, 1.0))
-                ny = float(np.clip(ny, 0.0, 1.0))
-                mx = nx * self.goal_width_m
-                my = ny * self.goal_height_m
-                self.last_event_time = now_s
-                self.event_latched = True
-                self.history.clear()
-                self.last_camera_side_time = -1e9
-                return ImpactEvent(
-                    timestamp=now_s,
-                    frame_index=frame_index,
-                    event_type="entry",
-                    pixel_point=event_point_xy,
-                    normalized_point=(nx, ny),
-                    meters_point=(mx, my),
-                    speed_before=entry_speed,
-                    speed_after=entry_speed,
-                    angle_change_deg=0.0,
+                recovery_default_xy = center_px
+                if self.last_camera_side_center is not None:
+                    entry_point = find_entry_point(self.last_camera_side_center.astype(np.float32), p2, goal_corners)
+                    if entry_point is not None:
+                        recovery_default_xy = (int(entry_point[0]), int(entry_point[1]))
+                    else:
+                        edge_point = closest_point_on_polygon(p2, goal_corners.astype(np.float32))
+                        recovery_default_xy = (int(edge_point[0]), int(edge_point[1]))
+                event_point_xy = entry_display_point(recovery_default_xy)
+                return arm_entry_confirmation(
+                    event_point_xy=event_point_xy,
+                    event_timestamp_s=now_s,
+                    event_frame_index=frame_index,
+                    event_speed=entry_speed,
                 )
 
         if len(self.history) < 3:
@@ -530,6 +588,7 @@ class ImpactDetector:
         self.event_latched = True
         self.history.clear()
         self.last_camera_side_time = -1e9
+        self.last_camera_side_center = None
 
         return ImpactEvent(
             timestamp=now_s,

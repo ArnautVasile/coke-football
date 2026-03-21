@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import platform
+import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -52,6 +53,70 @@ class HybridBallDetector:
         return ""
 
 
+class AsyncLatestCapture:
+    """Background camera reader that always exposes the latest frame."""
+
+    def __init__(self, cap: cv2.VideoCapture) -> None:
+        self.cap = cap
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._latest_frame: np.ndarray | None = None
+        self._latest_seq = 0
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, name="AsyncLatestCapture", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            ok, frame = self.cap.read()
+            if not ok or frame is None:
+                time.sleep(0.002)
+                continue
+            with self._lock:
+                self._latest_frame = frame
+                self._latest_seq += 1
+
+    def seed(self, frame: np.ndarray) -> None:
+        with self._lock:
+            self._latest_frame = frame
+            if self._latest_seq <= 0:
+                self._latest_seq = 1
+
+    def read(
+        self,
+        timeout_s: float = 0.20,
+        *,
+        after_seq: int | None = None,
+    ) -> tuple[bool, np.ndarray | None, int]:
+        start = time.time()
+        with self._lock:
+            latest = self._latest_frame
+            latest_seq = self._latest_seq
+        if latest is not None and (after_seq is None or latest_seq != after_seq):
+            return True, latest, latest_seq
+        while (time.time() - start) <= max(0.01, float(timeout_s)):
+            with self._lock:
+                latest = self._latest_frame
+                latest_seq = self._latest_seq
+                if latest is not None and (after_seq is None or latest_seq != after_seq):
+                    return True, latest, latest_seq
+            time.sleep(0.001)
+        with self._lock:
+            latest = self._latest_frame
+            latest_seq = self._latest_seq
+            return (latest is not None), latest, latest_seq
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.35)
+            self._thread = None
+
+
 def hit_zone_name(nx: float, ny: float) -> str:
     if nx < 0.33:
         col = "Left"
@@ -80,6 +145,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
     parser.add_argument("--fps", type=int, default=60)
+    parser.add_argument(
+        "--async-capture",
+        dest="async_capture",
+        action="store_true",
+        help="Use a background latest-frame camera reader for live camera input",
+    )
+    parser.add_argument(
+        "--no-async-capture",
+        dest="async_capture",
+        action="store_false",
+        help="Disable background latest-frame camera reader",
+    )
+    parser.set_defaults(async_capture=True)
     parser.add_argument("--force-resize-input", action="store_true", help="Resize incoming frames to --width/--height")
     parser.add_argument("--goal-width-m", type=float, default=7.32)
     parser.add_argument("--goal-height-m", type=float, default=2.44)
@@ -163,7 +241,20 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(auto_lock_tracker=False)
     parser.add_argument("--tracker-lock-scale", type=float, default=1.9, help="Tracker init box size scale from detected ball radius")
     parser.add_argument("--display-scale", type=float, default=1.0, help="Display-only resize factor to reduce GUI cost")
+    parser.add_argument("--display-every", type=int, default=1, help="Refresh OpenCV preview every N frames (higher improves FPS)")
+    parser.add_argument("--no-display", action="store_true", help="Disable OpenCV preview/UI loop for maximum processing FPS")
     parser.add_argument("--stats-every", type=int, default=120, help="Print runtime stats every N frames")
+    parser.add_argument(
+        "--perf-breakdown",
+        action="store_true",
+        help="Print per-stage timing breakdown every --stats-every frames to diagnose FPS bottlenecks",
+    )
+    parser.add_argument(
+        "--perf-breakdown-top",
+        type=int,
+        default=6,
+        help="How many top stages to print when --perf-breakdown is enabled",
+    )
     parser.add_argument("--detector", choices=["motion", "yolo", "hybrid", "vision"], default="motion")
     parser.add_argument("--min-area", type=int, default=120, help="Min contour area for ball candidates")
     parser.add_argument("--max-area", type=int, default=6000, help="Max contour area for ball candidates")
@@ -277,6 +368,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-impact-entry", dest="impact_enable_entry", action="store_false", help="Disable outside->inside crossing events")
     parser.set_defaults(impact_enable_entry=True)
     parser.add_argument("--impact-entry-min-speed", type=float, default=35.0, help="Min speed for entry hit event (px/s)")
+    parser.add_argument(
+        "--impact-entry-fallbacks",
+        dest="impact_entry_fallbacks",
+        action="store_true",
+        help="Allow permissive entry fallbacks (first-inside, near-plane, recovery) when exact crossing frame is missed",
+    )
+    parser.add_argument(
+        "--no-impact-entry-fallbacks",
+        dest="impact_entry_fallbacks",
+        action="store_false",
+        help="Strict entry mode: require clean outside->inside crossing confirmation only",
+    )
+    parser.set_defaults(impact_entry_fallbacks=True)
+    parser.add_argument(
+        "--impact-entry-confirm-frames",
+        type=int,
+        default=1,
+        help="Require N consecutive inside-goal frames before confirming an entry; event location stays at the first inside frame",
+    )
     parser.add_argument("--impact-arm-seconds", type=float, default=1.2, help="Ignore impacts during startup/recalibration")
     parser.add_argument(
         "--impact-rearm-outside-ratio",
@@ -371,6 +481,19 @@ def parse_args() -> argparse.Namespace:
         help="Disable motion fallback for goal-entry detection",
     )
     parser.set_defaults(event_motion_fallback=True)
+    parser.add_argument(
+        "--event-motion-after-reject",
+        dest="event_motion_after_reject",
+        action="store_true",
+        help="After YOLO candidate is rejected (goal margin/background), run one extra motion fallback pass in the same frame",
+    )
+    parser.add_argument(
+        "--no-event-motion-after-reject",
+        dest="event_motion_after_reject",
+        action="store_false",
+        help="Do not run extra motion fallback after a rejected YOLO candidate (safer, less permissive)",
+    )
+    parser.set_defaults(event_motion_after_reject=False)
     parser.add_argument("--candidate-overlay-ttl", type=float, default=0.35, help="How long to keep blue candidate marker visible")
     parser.add_argument("--ball-overlay-ttl", type=float, default=0.45, help="How long to keep ball marker visible after detection")
     parser.add_argument(
@@ -537,6 +660,95 @@ def print_perf_hints(args: argparse.Namespace) -> None:
         print(
             "[PerfHint] YOLO track mode adds extra overhead every frame. Disable --yolo-track first when testing raw detector FPS."
         )
+
+
+def add_perf_sample(
+    perf_sums_s: dict[str, float],
+    key: str,
+    dt_s: float,
+) -> None:
+    perf_sums_s[key] = perf_sums_s.get(key, 0.0) + max(0.0, float(dt_s))
+
+
+def yolo_runtime_provider_name(ball_detector: BallDetector) -> str:
+    detector_obj = ball_detector
+    if isinstance(detector_obj, HybridBallDetector):
+        detector_obj = detector_obj.primary
+    if not isinstance(detector_obj, YoloBallDetector):
+        return "n/a"
+    predictor = getattr(detector_obj.model, "predictor", None)
+    backend = getattr(predictor, "model", None)
+    session = getattr(backend, "session", None)
+    if session is None or not hasattr(session, "get_providers"):
+        return "unknown"
+    providers = session.get_providers()
+    return providers[0] if providers else "unknown"
+
+
+def print_perf_breakdown(
+    *,
+    perf_sums_s: dict[str, float],
+    frames_done: int,
+    top_n: int,
+    detector_name: str,
+    args: argparse.Namespace,
+    ball_detector: BallDetector,
+) -> None:
+    if frames_done <= 0:
+        return
+    total_s = max(1e-9, perf_sums_s.get("loop_total", 0.0))
+    stage_rows: list[tuple[str, float, float, float]] = []
+    for key, stage_s in perf_sums_s.items():
+        if key == "loop_total":
+            continue
+        avg_ms = (stage_s * 1000.0) / max(1, frames_done)
+        pct = (stage_s / total_s) * 100.0
+        stage_rows.append((key, stage_s, avg_ms, pct))
+    stage_rows.sort(key=lambda x: x[1], reverse=True)
+    keep_n = max(1, int(top_n))
+    if not stage_rows:
+        return
+
+    detail = ", ".join(
+        f"{name}={avg_ms:.2f}ms({pct:.0f}%)"
+        for name, _stage_s, avg_ms, pct in stage_rows[:keep_n]
+    )
+    print(f"[PerfDetail] {detail}")
+
+    if detector_name in ("yolo", "hybrid"):
+        provider = yolo_runtime_provider_name(ball_detector)
+        print(f"[PerfDetail] yolo_runtime_provider={provider}")
+
+    top_name, _top_stage_s, _top_avg_ms, top_pct = stage_rows[0]
+    top_pct = float(top_pct)
+    if top_name == "detect_track" and top_pct >= 45.0:
+        print(
+            "[PerfDetailHint] detector dominates frame time. Try lower --yolo-imgsz, higher --process-every, "
+            "and confirm CoreML provider is active (not CPU fallback)."
+        )
+    elif top_name == "pose_adapt" and top_pct >= 30.0:
+        print(
+            "[PerfDetailHint] pose/adaptation is heavy. Try higher --goal-pose-every (e.g. 5-8) "
+            "and/or disable auto-adapt when camera is fixed."
+        )
+    elif top_name == "overlay_show" and top_pct >= 25.0:
+        print(
+            "[PerfDetailHint] overlay/display is heavy. Try --minimal-overlay and/or lower --display-scale."
+        )
+    elif top_name == "capture_preproc" and top_pct >= 35.0:
+        print(
+            "[PerfDetailHint] camera read/preprocess dominates. Check camera backend/FPS mode and avoid extra resize/undistort where possible."
+        )
+
+
+def read_ui_key(*, video_controls_enabled: bool, playback_paused: bool) -> int:
+    if video_controls_enabled and playback_paused:
+        return cv2.waitKey(0) & 0xFF
+    poll_key = getattr(cv2, "pollKey", None)
+    if callable(poll_key):
+        raw = int(poll_key())
+        return (raw & 0xFF) if raw >= 0 else 0xFF
+    return cv2.waitKey(1) & 0xFF
 
 
 def maybe_resize_input(frame: np.ndarray, width: int, height: int, enabled: bool) -> np.ndarray:
@@ -721,6 +933,8 @@ def create_impact_detector_for_goal(
         min_displacement_px=args.impact_min_displacement,
         enable_entry_event=args.impact_enable_entry,
         min_entry_speed_px_s=args.impact_entry_min_speed,
+        entry_confirm_frames=args.impact_entry_confirm_frames,
+        allow_entry_fallbacks=args.impact_entry_fallbacks,
         rearm_outside_ratio=args.impact_rearm_outside_ratio,
         rearm_camera_margin_m=args.impact_rearm_camera_margin_m,
         rearm_miss_seconds=args.impact_rearm_miss_seconds,
@@ -862,6 +1076,18 @@ def detection_near_goal(
     # ball can overlap the goal opening while its center is still just outside.
     overlap_margin = max(0.0, float(margin_px)) + max(0.0, float(ball.radius))
     return signed >= -overlap_margin
+
+
+def detection_outside_goal_opening(
+    ball: BallDetection | None,
+    goal_corners: np.ndarray,
+    *,
+    center_inside_margin_px: float = 0.0,
+) -> bool:
+    if ball is None:
+        return False
+    signed = signed_distance_to_polygon((float(ball.center[0]), float(ball.center[1])), goal_corners)
+    return signed < -max(0.0, float(center_inside_margin_px))
 
 
 def project_point_to_goal_normalized(
@@ -1572,10 +1798,23 @@ def main() -> None:
         backend_name = "BallVisionHelper"
     video_controls_enabled = cap is not None and isinstance(source, str) and Path(str(source)).exists()
     video_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if video_controls_enabled and cap is not None else 0
+    async_capture: AsyncLatestCapture | None = None
+    async_capture_seq = 0
+    if cap is not None and bool(args.async_capture) and not video_controls_enabled:
+        async_capture = AsyncLatestCapture(cap)
+        async_capture.seed(frame)
+        async_capture.start()
     print(
         f"[Camera] requested={args.width}x{args.height}@{requested_fps} "
         f"actual={actual_w}x{actual_h}@{actual_fps:.1f} backend={backend_name} codec={actual_fourcc}"
     )
+    if cap is not None:
+        if async_capture is not None:
+            print("[Camera] async latest-frame reader enabled for live camera input")
+        elif bool(args.async_capture) and video_controls_enabled:
+            print("[Camera] async latest-frame reader disabled for video playback controls")
+        else:
+            print("[Camera] async latest-frame reader disabled by flag")
     print(
         f"[Detect] mode={'full-frame' if args.detect_full_frame else f'goal-roi+{args.detect_roi_margin}px'} "
         f"detector={args.detector}"
@@ -1632,8 +1871,13 @@ def main() -> None:
         )
     if args.force_resize_input and (actual_w != args.width or actual_h != args.height):
         print(f"[Camera] force resize enabled: processing resized frames at {args.width}x{args.height}")
+    if args.no_display:
+        print("[Display] disabled (--no-display): highest FPS mode; stop with Ctrl+C.")
+    elif max(1, int(args.display_every)) > 1:
+        print(f"[Display] refreshing preview every {max(1, int(args.display_every))} frames")
 
-    cv2.namedWindow("Goal Impact Tracker", cv2.WINDOW_NORMAL)
+    if not args.no_display:
+        cv2.namedWindow("Goal Impact Tracker", cv2.WINDOW_NORMAL)
     frame_idx = 0
     last_time = time.time()
     fps = 0.0
@@ -1661,6 +1905,12 @@ def main() -> None:
     stats_last_t = time.time()
     stats_last_frame = 0
     stats_det_runs = 0
+    perf_breakdown_enabled = bool(args.perf_breakdown)
+    perf_sums_s: dict[str, float] = {}
+    stats_pose_solve_calls = 0
+    stats_pose_solve_ok = 0
+    stats_pose_fail_reasons: dict[str, int] = {}
+    pose_fail_backoff = 1
     trajectory_observations: deque[tuple[int, float, BallDetection]] = deque(maxlen=4)
     miss_candidate_active = False
     miss_candidate_started_t = 0.0
@@ -1688,8 +1938,21 @@ def main() -> None:
                 impact_armed_at = time.time() + max(0.0, args.impact_arm_seconds)
 
     while True:
+        loop_perf_t0 = time.perf_counter()
+        capture_t0 = loop_perf_t0
         if cap is not None:
-            ok, frame = cap.read()
+            if async_capture is not None:
+                ok, next_frame, next_seq = async_capture.read(timeout_s=0.20, after_seq=async_capture_seq)
+                if not ok or next_frame is None:
+                    break
+                if next_seq == async_capture_seq:
+                    continue
+                async_capture_seq = next_seq
+                frame = next_frame
+            else:
+                ok, frame = cap.read()
+                if not ok:
+                    break
             if not ok:
                 break
             step_video_frame = False
@@ -1701,6 +1964,8 @@ def main() -> None:
             if next_frame is None:
                 continue
             frame = next_frame
+        if perf_breakdown_enabled:
+            add_perf_sample(perf_sums_s, "capture_preproc", time.perf_counter() - capture_t0)
 
         now = time.time()
         dt = max(1e-6, now - last_time)
@@ -1708,19 +1973,26 @@ def main() -> None:
         last_time = now
         frame_idx += 1
 
+        pose_t0 = time.perf_counter()
         active_goal_pose: GoalPoseEstimate | None = None
         pose_status_label: str | None = None
         pose_error_px: float | None = None
         if goal_marker_layout is not None and camera_intrinsics is not None:
             pose_every = max(1, int(args.goal_pose_every))
+            effective_pose_every = max(1, pose_every * max(1, int(pose_fail_backoff)))
             should_solve_pose = (
-                latest_goal_pose is None
-                or frame_idx <= 1
-                or (frame_idx % pose_every) == 0
+                frame_idx <= 1
+                or (frame_idx % effective_pose_every) == 0
             )
             if should_solve_pose:
+                stats_pose_solve_calls += 1
+                pose_solve_t0 = time.perf_counter()
                 pose_estimate, _marker_corners, _marker_ids, pose_debug = solve_goal_pose(frame, goal_marker_layout, camera_intrinsics)
+                if perf_breakdown_enabled:
+                    add_perf_sample(perf_sums_s, "pose_solve_only", time.perf_counter() - pose_solve_t0)
                 if pose_estimate is not None:
+                    stats_pose_solve_ok += 1
+                    pose_fail_backoff = 1
                     latest_goal_pose = pose_estimate
                     latest_goal_pose_time = now
                     alpha = float(np.clip(args.goal_pose_alpha, 0.0, 1.0))
@@ -1734,6 +2006,12 @@ def main() -> None:
                     pose_error_px = latest_goal_pose.reprojection_error_px
                 else:
                     pose_status_label = pose_debug.status
+                    reason_key = str(pose_debug.status or "unknown pose solve failure").strip()
+                    stats_pose_fail_reasons[reason_key] = stats_pose_fail_reasons.get(reason_key, 0) + 1
+                    if reason_key.startswith("Need at least 3 markers"):
+                        pose_fail_backoff = min(8, max(1, pose_fail_backoff) * 2)
+                    else:
+                        pose_fail_backoff = min(4, max(1, pose_fail_backoff + 1))
             elif latest_goal_pose is not None and (now - latest_goal_pose_time) <= max(0.0, args.goal_pose_max_age):
                 active_goal_pose = latest_goal_pose
                 pose_status_label = "OK"
@@ -1751,7 +2029,10 @@ def main() -> None:
             goal_homography = build_goal_homography(current_corners)
         except cv2.error:
             goal_homography = np.eye(3, dtype=np.float32)
+        if perf_breakdown_enabled:
+            add_perf_sample(perf_sums_s, "pose_adapt", time.perf_counter() - pose_t0)
 
+        detect_track_t0 = time.perf_counter()
         roi = fixed_detect_roi
         if roi is None and not args.detect_full_frame:
             roi = goal_roi(current_corners, frame.shape, margin=max(0, int(args.detect_roi_margin)))
@@ -1852,6 +2133,23 @@ def main() -> None:
                 candidate_ball = None
                 candidate_from_tracker = False
                 detector_reject_reason = "reject: background"
+        # If YOLO produced a rejectable candidate (e.g. outside goal margin/background),
+        # still try motion fallback near the goal in the same frame so entry events are
+        # not lost to a single bad class-based pick.
+        if (
+            run_detector
+            and candidate_ball is None
+            and motion_event_candidate is None
+            and event_motion_detector is not None
+            and (not args.ball_only_mode)
+            and bool(args.event_motion_after_reject)
+        ):
+            motion_roi = roi
+            if motion_roi is None:
+                motion_margin = max(int(args.goal_presence_margin_px), int(args.detect_roi_margin))
+                motion_roi = goal_roi(current_corners, frame.shape, margin=motion_margin)
+            if motion_roi is not None:
+                motion_event_candidate = event_motion_detector.detect(frame, roi=motion_roi)
         if candidate_ball is not None:
             last_candidate = candidate_ball
             last_candidate_seen_t = now
@@ -1918,7 +2216,10 @@ def main() -> None:
                         tracker_failures = 0
                         impact_detector.reset_history()
                         trajectory_observations.clear()
+        if perf_breakdown_enabled:
+            add_perf_sample(perf_sums_s, "detect_track", time.perf_counter() - detect_track_t0)
 
+        event_t0 = time.perf_counter()
         event = None
         bridge_ball: BallDetection | None = None
         event_ball: BallDetection | None = trusted_ball
@@ -2000,6 +2301,11 @@ def main() -> None:
                     current_corners,
                     args.goal_presence_margin_px,
                 )
+                outside_opening_for_miss = detection_outside_goal_opening(
+                    event_ball,
+                    current_corners,
+                    center_inside_margin_px=0.0,
+                )
                 surface_distance_m = (
                     float(plane_estimate.surface_distance_m)
                     if plane_estimate is not None
@@ -2008,6 +2314,10 @@ def main() -> None:
                 near_plane_for_miss = (
                     surface_distance_m is not None
                     and surface_distance_m <= max(0.01, float(args.miss_near_plane_m))
+                )
+                through_goal_plane_for_miss = (
+                    surface_distance_m is not None
+                    and surface_distance_m <= 0.0
                 )
                 timeout_s = max(0.05, float(args.miss_timeout_s))
                 stale_window_s = max(0.12, min(0.35, timeout_s * 0.35))
@@ -2018,9 +2328,21 @@ def main() -> None:
                     miss_candidate_best_surface_m = float("inf")
                     miss_rearm_until = now + max(0.0, float(args.miss_cooldown_s))
                 else:
+                    # Guardrail: MISS is only valid for shots that stayed outside
+                    # the opening. If the ball is in/through the goal, suppress MISS.
+                    if miss_candidate_active and (
+                        (not outside_opening_for_miss) or through_goal_plane_for_miss
+                    ):
+                        miss_candidate_active = False
+                        miss_candidate_point_xy = None
+                        miss_candidate_best_surface_m = float("inf")
+                        miss_rearm_until = now + max(0.0, float(args.miss_cooldown_s))
+
                     if (
                         near_goal_for_miss
                         and near_plane_for_miss
+                        and outside_opening_for_miss
+                        and (not through_goal_plane_for_miss)
                         and event_ball is not None
                         and now >= miss_rearm_until
                     ):
@@ -2046,6 +2368,19 @@ def main() -> None:
                         stale_enough = (now - miss_candidate_last_seen_t) >= stale_window_s
                         if (not (near_goal_for_miss and near_plane_for_miss)) or stale_enough:
                             point_xy = miss_candidate_point_xy
+                            if point_xy is not None:
+                                # Final safety check: only emit MISS if the saved
+                                # candidate point is still outside the opening.
+                                point_signed = signed_distance_to_polygon(
+                                    (float(point_xy[0]), float(point_xy[1])),
+                                    current_corners,
+                                )
+                                if point_signed >= 0.0:
+                                    miss_candidate_active = False
+                                    miss_candidate_point_xy = None
+                                    miss_candidate_best_surface_m = float("inf")
+                                    miss_rearm_until = now + max(0.0, float(args.miss_cooldown_s))
+                                    point_xy = None
                             if point_xy is not None:
                                 nx, ny = project_point_to_goal_normalized(
                                     point_xy,
@@ -2078,7 +2413,10 @@ def main() -> None:
             recent_hits.append(event)
             flash_until = now + 0.35
             append_hit_event(log_path, event)
+        if perf_breakdown_enabled:
+            add_perf_sample(perf_sums_s, "event_logic", time.perf_counter() - event_t0)
 
+        overlay_t0 = time.perf_counter()
         flash_strength = max(0.0, min(1.0, (flash_until - now) / 0.35))
         if video_controls_enabled:
             # In prerecorded-video review mode, show exact state for the current frame instead of
@@ -2159,24 +2497,35 @@ def main() -> None:
             minimal_overlay=args.minimal_overlay,
         )
 
-        if roi is not None:
-            x1, y1, x2, y2 = roi
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (180, 180, 180), 1)
-        if args.display_scale < 0.999:
-            frame_show = cv2.resize(
-                frame,
-                None,
-                fx=args.display_scale,
-                fy=args.display_scale,
-                interpolation=cv2.INTER_LINEAR,
-            )
-        else:
-            frame_show = frame
-        cv2.imshow("Goal Impact Tracker", frame_show)
+        display_every = max(1, int(args.display_every))
+        should_refresh_display = (not args.no_display) and ((frame_idx % display_every) == 0)
+        if should_refresh_display:
+            if roi is not None:
+                x1, y1, x2, y2 = roi
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (180, 180, 180), 1)
+            if args.display_scale < 0.999:
+                frame_show = cv2.resize(
+                    frame,
+                    None,
+                    fx=args.display_scale,
+                    fy=args.display_scale,
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            else:
+                frame_show = frame
+            cv2.imshow("Goal Impact Tracker", frame_show)
+        if perf_breakdown_enabled:
+            add_perf_sample(perf_sums_s, "overlay_show", time.perf_counter() - overlay_t0)
 
+        input_t0 = time.perf_counter()
         should_quit = False
         while True:
-            key = cv2.waitKey(0 if (video_controls_enabled and playback_paused) else 1) & 0xFF
+            if args.no_display:
+                key = 0xFF
+            elif should_refresh_display or (video_controls_enabled and playback_paused):
+                key = read_ui_key(video_controls_enabled=video_controls_enabled, playback_paused=playback_paused)
+            else:
+                key = 0xFF
             if key in (27, ord("q")):
                 should_quit = True
                 break
@@ -2236,6 +2585,7 @@ def main() -> None:
                 trajectory_observations.clear()
                 latest_goal_pose = None
                 latest_goal_pose_time = 0.0
+                pose_fail_backoff = 1
                 latest_event = None
                 last_event_seen_t = 0.0
                 recent_hits.clear()
@@ -2247,6 +2597,9 @@ def main() -> None:
                     break
                 continue
             break
+        if perf_breakdown_enabled:
+            add_perf_sample(perf_sums_s, "input_wait", time.perf_counter() - input_t0)
+            add_perf_sample(perf_sums_s, "loop_total", time.perf_counter() - loop_perf_t0)
         if should_quit:
             break
 
@@ -2259,10 +2612,43 @@ def main() -> None:
                 f"[Perf] loop_fps={measured_fps:.1f} detector_calls_s={det_rate:.1f} "
                 f"detector={args.detector} process_every={args.process_every} adapt_every={args.adapt_every}"
             )
+            if perf_breakdown_enabled:
+                print_perf_breakdown(
+                    perf_sums_s=perf_sums_s,
+                    frames_done=frames_done,
+                    top_n=args.perf_breakdown_top,
+                    detector_name=args.detector,
+                    args=args,
+                    ball_detector=ball_detector,
+                )
+                pose_every = max(1, int(args.goal_pose_every))
+                print(
+                    f"[PerfDetail] pose_solve_calls={stats_pose_solve_calls} "
+                    f"pose_solve_ok={stats_pose_solve_ok} pose_every={pose_every} "
+                    f"pose_fail_backoff={pose_fail_backoff}"
+                )
+                if stats_pose_solve_calls > max(1, int(frames_done / max(1, pose_every)) + 2):
+                    print(
+                        "[PerfDetailHint] pose solver is running more often than expected for --goal-pose-every. "
+                        "Check whether marker pose is repeatedly stale/lost."
+                    )
+                if stats_pose_solve_calls > 0 and stats_pose_solve_ok == 0 and stats_pose_fail_reasons:
+                    top_reason, top_count = max(stats_pose_fail_reasons.items(), key=lambda kv: kv[1])
+                    print(f"[PerfDetail] pose_fail_top=\"{top_reason}\" count={top_count}")
+                    print(
+                        "[PerfDetailHint] pose has zero successful solves in this window. "
+                        "Fix marker visibility/layout first or temporarily run --ball-only-mode for detector FPS checks."
+                    )
+                perf_sums_s.clear()
+                stats_pose_solve_calls = 0
+                stats_pose_solve_ok = 0
+                stats_pose_fail_reasons.clear()
             stats_last_t = time.time()
             stats_last_frame = frame_idx
             stats_det_runs = 0
 
+    if async_capture is not None:
+        async_capture.stop()
     if cap is not None:
         cap.release()
     detector_close = getattr(ball_detector, "close", None)

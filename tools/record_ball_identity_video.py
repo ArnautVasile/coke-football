@@ -27,6 +27,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--duration-seconds", type=int, default=60, help="How long to record once started")
     parser.add_argument("--countdown-seconds", type=int, default=3, help="Countdown before recording starts")
+    parser.add_argument(
+        "--max-no-frame-seconds",
+        type=float,
+        default=2.0,
+        help="Allow brief camera read dropouts; abort only if no frames arrive for this long",
+    )
     parser.add_argument("--output", default="", help="Optional explicit output video path")
     parser.add_argument("--output-dir", default="data/identity/raw_video", help="Directory for recorded videos when --output is omitted")
     parser.add_argument("--prefix", default="ball_identity", help="Filename prefix when --output is omitted")
@@ -109,12 +115,23 @@ def main() -> None:
     measured_fps = 0.0
     last_terminal_fps_log = 0.0
     interrupted = False
+    no_frame_since: float | None = None
 
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
-                raise RuntimeError("Camera stopped delivering frames while recording.")
+                if no_frame_since is None:
+                    no_frame_since = time.time()
+                if (time.time() - no_frame_since) > max(0.25, float(args.max_no_frame_seconds)):
+                    raise RuntimeError(
+                        "Camera is not delivering frames (startup/countdown). "
+                        "Try lowering requested mode or close other apps that use the camera."
+                    )
+                if not args.no_preview:
+                    cv2.waitKey(1)
+                continue
+            no_frame_since = None
 
             now = time.time()
             fps_frame_count += 1
@@ -149,10 +166,29 @@ def main() -> None:
             break
 
         duration = max(1, int(args.duration_seconds))
+        no_frame_since = None
         while True:
             ok, frame = cap.read()
             if not ok:
-                break
+                if no_frame_since is None:
+                    no_frame_since = time.time()
+                if (time.time() - no_frame_since) > max(0.25, float(args.max_no_frame_seconds)):
+                    print(
+                        "[IdentityRecord] camera frame stream stalled for too long; "
+                        "stopping early and saving recorded portion."
+                    )
+                    break
+                if not args.no_preview:
+                    cv2.waitKey(1)
+                continue
+            no_frame_since = None
+            now = time.time()
+            fps_frame_count += 1
+            elapsed_fps = now - fps_counter_start
+            if elapsed_fps >= 0.8:
+                measured_fps = fps_frame_count / max(elapsed_fps, 1e-6)
+                fps_counter_start = now
+                fps_frame_count = 0
             assert writer is not None
             writer.write(frame)
             elapsed = time.time() - record_start
