@@ -23,6 +23,11 @@ class ImpactEvent:
     speed_before: float
     speed_after: float
     angle_change_deg: float
+    debug_source: str = ""
+    debug_plane_state: str = ""
+    debug_surface_signed_m: float | None = None
+    debug_plane_margin_m: float | None = None
+    debug_note: str = ""
 
 
 def build_goal_homography(corners: np.ndarray) -> np.ndarray:
@@ -157,13 +162,14 @@ class ImpactDetector:
         self.min_entry_speed_px_s = max(0.0, float(min_entry_speed_px_s))
         self.entry_confirm_frames = max(1, int(entry_confirm_frames))
         mode = str(entry_point_mode or "first").strip().lower()
-        self.entry_point_mode = mode if mode in ("first", "last") else "first"
+        self.entry_point_mode = mode if mode in ("first", "last", "deepest") else "first"
         self.allow_entry_fallbacks = bool(allow_entry_fallbacks)
         self.rearm_outside_ratio = max(0.10, float(rearm_outside_ratio))
         self.rearm_camera_margin_m = max(0.01, float(rearm_camera_margin_m))
         self.rearm_miss_seconds = max(0.0, float(rearm_miss_seconds))
         self.first_inside_edge_px = 30.0
         self.first_inside_inward_px = 2.0
+        self.deepest_entry_hold_s = max(0.60, min(1.60, self.max_dt_s * 6.0))
 
         self.history: Deque[tuple[float, np.ndarray, float | None]] = deque(maxlen=8)
         self.last_event_time = 0.0
@@ -180,6 +186,10 @@ class ImpactDetector:
         self.pending_entry_timestamp = 0.0
         self.pending_entry_frame_index = 0
         self.pending_entry_speed = 0.0
+        self.pending_entry_source = ""
+        self.pending_entry_note = ""
+        self.pending_entry_started_time = 0.0
+        self.pending_entry_best_depth_m = 0.0
         self.pending_entry_last_seen_time = 0.0
         self.pending_entry_missing_grace_s = max(0.08, float(self.max_dt_s) * 2.0)
         self.pending_entry_outside_grace_px = 10.0
@@ -201,6 +211,10 @@ class ImpactDetector:
         self.pending_entry_timestamp = 0.0
         self.pending_entry_frame_index = 0
         self.pending_entry_speed = 0.0
+        self.pending_entry_source = ""
+        self.pending_entry_note = ""
+        self.pending_entry_started_time = 0.0
+        self.pending_entry_best_depth_m = 0.0
         self.pending_entry_last_seen_time = 0.0
 
     def get_debug_reason(self) -> str:
@@ -239,14 +253,32 @@ class ImpactDetector:
             plane_signed_distance_m is not None
             and camera_signed_distance_m is not None
         ):
+            surface_signed_distance_m = self._surface_signed_distance(plane_signed_distance_m, ball_radius_m)
             plane_release_margin = max(
                 self.rearm_camera_margin_m,
-                float(ball_radius_m or 0.0) + max(0.0, float(plane_contact_tolerance_m)),
+                max(0.0, float(plane_contact_tolerance_m)),
             )
-            same_as_camera_side = float(plane_signed_distance_m) * float(camera_signed_distance_m) >= 0.0
-            if same_as_camera_side and abs(float(plane_signed_distance_m)) >= plane_release_margin:
+            same_as_camera_side = (
+                surface_signed_distance_m is not None
+                and float(surface_signed_distance_m) * float(camera_signed_distance_m) >= 0.0
+            )
+            if same_as_camera_side and surface_signed_distance_m is not None and abs(float(surface_signed_distance_m)) >= plane_release_margin:
                 self.event_latched = False
                 self.history.clear()
+
+    @staticmethod
+    def _surface_signed_distance(
+        center_signed_distance_m: float | None,
+        ball_radius_m: float | None,
+    ) -> float | None:
+        if center_signed_distance_m is None or ball_radius_m is None:
+            return None
+        signed_distance_m = float(center_signed_distance_m)
+        radius_m = max(0.0, float(ball_radius_m))
+        return math.copysign(
+            max(0.0, abs(signed_distance_m) - radius_m),
+            signed_distance_m,
+        )
 
     @staticmethod
     def _plane_contact_ok(
@@ -257,10 +289,14 @@ class ImpactDetector:
     ) -> bool:
         if prev_signed_distance_m is None or cur_signed_distance_m is None or ball_radius_m is None:
             return True
-        margin = max(0.01, (2.0 * float(ball_radius_m)) + max(0.0, float(tolerance_m)))
-        if abs(prev_signed_distance_m) <= margin or abs(cur_signed_distance_m) <= margin:
+        prev_surface_m = ImpactDetector._surface_signed_distance(prev_signed_distance_m, ball_radius_m)
+        cur_surface_m = ImpactDetector._surface_signed_distance(cur_signed_distance_m, ball_radius_m)
+        if prev_surface_m is None or cur_surface_m is None:
             return True
-        return (prev_signed_distance_m * cur_signed_distance_m) < 0.0
+        tolerance_m = max(0.0, float(tolerance_m))
+        if abs(prev_surface_m) <= tolerance_m or abs(cur_surface_m) <= tolerance_m:
+            return True
+        return (prev_surface_m * cur_surface_m) < 0.0
 
     def update(
         self,
@@ -361,11 +397,36 @@ class ImpactDetector:
         def oriented_surface_distance(signed_distance_m: float | None) -> float | None:
             if signed_distance_m is None or camera_side_sign is None or ball_radius_m is None:
                 return None
-            oriented_center_m = float(signed_distance_m) * float(camera_side_sign)
-            return math.copysign(
-                max(0.0, abs(oriented_center_m) - float(ball_radius_m)),
-                oriented_center_m,
-            )
+            surface_signed_m = self._surface_signed_distance(signed_distance_m, ball_radius_m)
+            if surface_signed_m is None:
+                return None
+            return float(surface_signed_m) * float(camera_side_sign)
+
+        def event_trigger_debug(
+            source: str,
+            note: str = "",
+        ) -> tuple[str, str, float | None, float | None, str]:
+            surface_signed_m = oriented_surface_distance(d2)
+            plane_state = ""
+            if surface_signed_m is not None:
+                if abs(surface_signed_m) <= 0.01:
+                    plane_state = "touching"
+                elif surface_signed_m > 0.0:
+                    plane_state = "camera side"
+                else:
+                    plane_state = "through goal"
+            plane_margin_m = None
+            if plane_contact_tolerance_m is not None:
+                plane_margin_m = max(0.0, float(plane_contact_tolerance_m))
+            if (
+                not note
+                and plane_state == "camera side"
+                and surface_signed_m is not None
+                and plane_margin_m is not None
+                and abs(float(surface_signed_m)) <= float(plane_margin_m)
+            ):
+                note = "within surface tolerance"
+            return source, plane_state, surface_signed_m, plane_margin_m, note
 
         def entry_display_point(default_xy: tuple[int, int]) -> tuple[int, int]:
             # For doorway goal-entry validation, operators expect the map/crosshair
@@ -375,10 +436,9 @@ class ImpactDetector:
             # large apparent left/right offsets on the hit map.
             if center_px is None:
                 return default_xy
-            if plane_signed_distance_m is not None and ball_radius_m is not None:
-                plane_margin = max(0.02, float(ball_radius_m) + max(0.0, float(plane_contact_tolerance_m)))
-                if abs(float(plane_signed_distance_m)) <= plane_margin:
-                    return center_px
+            surface_signed_m = self._surface_signed_distance(plane_signed_distance_m, ball_radius_m)
+            if surface_signed_m is not None and abs(float(surface_signed_m)) <= max(0.0, float(plane_contact_tolerance_m)):
+                return center_px
             # If we're already deep through the plane (rebound/late recovery),
             # keep the geometric crossing/default point to avoid plotting hits
             # at the later rebound location.
@@ -399,12 +459,18 @@ class ImpactDetector:
             event_timestamp_s: float,
             event_frame_index: int,
             event_speed: float,
+            event_source: str,
+            event_note: str = "",
         ) -> ImpactEvent:
             nx, ny = project_event_point(event_point_xy)
             nx = float(np.clip(nx, 0.0, 1.0))
             ny = float(np.clip(ny, 0.0, 1.0))
             mx = nx * self.goal_width_m
             my = ny * self.goal_height_m
+            debug_source, debug_plane_state, debug_surface_signed_m, debug_plane_margin_m, debug_note = event_trigger_debug(
+                event_source,
+                event_note,
+            )
             self.last_event_time = now_s
             self.event_latched = True
             self.history.clear()
@@ -422,6 +488,11 @@ class ImpactDetector:
                 speed_before=event_speed,
                 speed_after=event_speed,
                 angle_change_deg=0.0,
+                debug_source=debug_source,
+                debug_plane_state=debug_plane_state,
+                debug_surface_signed_m=debug_surface_signed_m,
+                debug_plane_margin_m=debug_plane_margin_m,
+                debug_note=debug_note,
             )
 
         def arm_entry_confirmation(
@@ -430,13 +501,17 @@ class ImpactDetector:
             event_timestamp_s: float,
             event_frame_index: int,
             event_speed: float,
+            event_source: str,
+            event_note: str = "",
         ) -> ImpactEvent | None:
-            if self.entry_confirm_frames <= 1:
+            if self.entry_point_mode != "deepest" and self.entry_confirm_frames <= 1:
                 return emit_entry_event(
                     event_point_xy=event_point_xy,
                     event_timestamp_s=event_timestamp_s,
                     event_frame_index=event_frame_index,
                     event_speed=event_speed,
+                    event_source=event_source,
+                    event_note=event_note,
                 )
             if not self.pending_entry_active:
                 self.pending_entry_active = True
@@ -445,10 +520,105 @@ class ImpactDetector:
                 self.pending_entry_timestamp = float(event_timestamp_s)
                 self.pending_entry_frame_index = int(event_frame_index)
                 self.pending_entry_speed = float(event_speed)
+                self.pending_entry_source = str(event_source)
+                self.pending_entry_note = str(event_note or "")
+                self.pending_entry_started_time = float(now_s)
+                self.pending_entry_best_depth_m = 0.0
+                if self.entry_point_mode == "deepest" and center_px is not None:
+                    armed_surface_m = oriented_surface_distance(d2)
+                    armed_depth_m = max(0.0, -float(armed_surface_m)) if armed_surface_m is not None else 0.0
+                    if armed_depth_m > 0.0:
+                        self.pending_entry_best_depth_m = float(armed_depth_m)
+                        self.pending_entry_point_xy = center_px
+                        self.pending_entry_timestamp = float(now_s)
+                        self.pending_entry_frame_index = int(frame_index)
+                        self.pending_entry_speed = float(event_speed)
+                        self.pending_entry_note = f"deepest through {armed_depth_m:.2f}m"
                 self.pending_entry_last_seen_time = float(now_s)
             return None
 
+        def emit_pending_deepest_entry(source_suffix: str) -> ImpactEvent | None:
+            if self.pending_entry_point_xy is None:
+                self._clear_pending_entry()
+                self.last_debug_reason = "event: deepest missing point"
+                return None
+            if self.pending_entry_best_depth_m <= 0.0:
+                self._clear_pending_entry()
+                self.last_debug_reason = "event: deepest no through-plane peak"
+                return None
+            pending_source = self.pending_entry_source or "entry"
+            peak_note = f"peak through {self.pending_entry_best_depth_m:.2f}m"
+            if self.pending_entry_note:
+                peak_note = f"{self.pending_entry_note}; {peak_note}"
+            return emit_entry_event(
+                event_point_xy=self.pending_entry_point_xy,
+                event_timestamp_s=self.pending_entry_timestamp,
+                event_frame_index=self.pending_entry_frame_index,
+                event_speed=self.pending_entry_speed,
+                event_source=f"{pending_source}-{source_suffix}",
+                event_note=peak_note,
+            )
+
         if self.pending_entry_active:
+            if self.entry_point_mode == "deepest":
+                rebound_margin_m = max(0.03, float(ball_radius_m or 0.0) * 0.18)
+                current_surface_m = oriented_surface_distance(d2)
+                current_depth_m = max(0.0, -float(current_surface_m)) if current_surface_m is not None else None
+
+                if cur_inside:
+                    self.pending_entry_count += 1
+                    self.pending_entry_last_seen_time = float(now_s)
+
+                    if center_px is not None and current_depth_m is not None and current_depth_m > (self.pending_entry_best_depth_m + 1e-4):
+                        self.pending_entry_best_depth_m = float(current_depth_m)
+                        self.pending_entry_point_xy = center_px
+                        self.pending_entry_timestamp = float(now_s)
+                        self.pending_entry_frame_index = int(frame_index)
+                        self.pending_entry_speed = float(max(self.pending_entry_speed, entry_speed))
+                        self.pending_entry_note = f"deepest through {current_depth_m:.2f}m"
+
+                    if self.pending_entry_count < max(1, int(self.entry_confirm_frames)):
+                        self.last_debug_reason = (
+                            f"event: entry confirm {self.pending_entry_count}/{max(1, int(self.entry_confirm_frames))}"
+                        )
+                        return None
+
+                    if self.pending_entry_best_depth_m <= 0.0:
+                        if (now_s - self.pending_entry_started_time) >= self.deepest_entry_hold_s:
+                            self._clear_pending_entry()
+                            self.last_debug_reason = "event: deepest timeout no through-plane"
+                        else:
+                            self.last_debug_reason = "event: deepest waiting through-plane"
+                        return None
+
+                    if current_depth_m is not None and (self.pending_entry_best_depth_m - current_depth_m) >= rebound_margin_m:
+                        self.last_debug_reason = "event: deepest rebound emit"
+                        return emit_pending_deepest_entry("deepest")
+
+                    if (now_s - self.pending_entry_started_time) >= self.deepest_entry_hold_s:
+                        self.last_debug_reason = "event: deepest timeout emit"
+                        return emit_pending_deepest_entry("deepest")
+
+                    self.last_debug_reason = f"event: deepest hold {self.pending_entry_best_depth_m:.2f}m"
+                    return None
+
+                near_boundary = signed_cur >= -(radius_margin + float(self.pending_entry_outside_grace_px))
+                if near_boundary:
+                    self.pending_entry_last_seen_time = float(now_s)
+                    if self.pending_entry_best_depth_m > 0.0:
+                        self.last_debug_reason = "event: deepest boundary emit"
+                        return emit_pending_deepest_entry("deepest")
+                    self.last_debug_reason = "event: deepest boundary wait"
+                    return None
+
+                if self.pending_entry_best_depth_m > 0.0:
+                    self.last_debug_reason = "event: deepest exit emit"
+                    return emit_pending_deepest_entry("deepest")
+
+                self._clear_pending_entry()
+                self.last_debug_reason = "event: deepest confirm lost"
+                return None
+
             if not cur_inside:
                 near_boundary = signed_cur >= -(radius_margin + float(self.pending_entry_outside_grace_px))
                 if near_boundary:
@@ -481,6 +651,8 @@ class ImpactDetector:
                             event_timestamp_s=self.pending_entry_timestamp,
                             event_frame_index=self.pending_entry_frame_index,
                             event_speed=self.pending_entry_speed,
+                            event_source=self.pending_entry_source or "entry-confirmed",
+                            event_note=self.pending_entry_note,
                         )
 
                 else:
@@ -510,6 +682,7 @@ class ImpactDetector:
                 event_timestamp_s=now_s,
                 event_frame_index=frame_index,
                 event_speed=entry_speed,
+                event_source="entry-crossing",
             )
 
         # Fallback for partial-visibility setups:
@@ -536,6 +709,7 @@ class ImpactDetector:
                         event_timestamp_s=now_s,
                         event_frame_index=frame_index,
                         event_speed=entry_speed,
+                        event_source="entry-first-inside",
                     )
 
         # Marker-based 3D gating can be noisy by a few frames, so keep a
@@ -550,14 +724,15 @@ class ImpactDetector:
             and d2 is not None
             and ball_radius_m is not None
         ):
-            plane_margin = max(0.02, (2.0 * float(ball_radius_m)) + max(0.0, float(plane_contact_tolerance_m)))
-            near_plane_now = abs(float(d2)) <= plane_margin
+            current_surface_m = self._surface_signed_distance(d2, ball_radius_m)
+            tolerance_m = max(0.0, float(plane_contact_tolerance_m))
+            near_plane_now = current_surface_m is not None and abs(float(current_surface_m)) <= tolerance_m
             prior_distances = [
-                abs(float(v))
+                abs(float(surface_m))
                 for v in (d0, d1)
-                if v is not None
+                if (surface_m := self._surface_signed_distance(v, ball_radius_m)) is not None
             ]
-            farther_before = (not prev_inside) or any(v > (plane_margin * 1.10) for v in prior_distances)
+            farther_before = (not prev_inside) or any(v > max(0.01, tolerance_m * 1.10) for v in prior_distances)
             centroid = np.mean(goal_corners.astype(np.float32), axis=0)
             moving_inward = float(np.dot((p2 - p1), (centroid - p1))) > -0.05 * max(entry_speed, 1.0)
             deeper_inside = signed_cur >= (signed_prev - max(2.0, radius_margin * 0.25))
@@ -570,7 +745,8 @@ class ImpactDetector:
                     event_timestamp_s=now_s,
                     event_frame_index=frame_index,
                     event_speed=entry_speed,
-                    )
+                    event_source="entry-near-plane",
+                )
 
         # Recovery fallback for detector/pose dropouts:
         # if the exact crossing frame was missed but the ball is now clearly
@@ -605,7 +781,8 @@ class ImpactDetector:
                     event_timestamp_s=now_s,
                     event_frame_index=frame_index,
                     event_speed=entry_speed,
-                    )
+                    event_source="entry-recovery",
+                )
 
         # Frontal shots can travel mostly along the camera axis, then drop after
         # net/wall contact. That can leave too little 2D bounce evidence for the
@@ -620,6 +797,7 @@ class ImpactDetector:
             and len(self.history) >= 2
         ):
             depth_progress_margin_m = max(0.03, float(ball_radius_m) * 0.22)
+            deep_through_threshold_m = max(0.05, float(ball_radius_m) * 0.45)
             recent_samples: list[tuple[float, np.ndarray, float | None]] = []
             prev_sample_t: float | None = None
             for sample_t, sample_center, sample_distance in reversed(self.history):
@@ -650,15 +828,29 @@ class ImpactDetector:
                 recently_camera_side = (now_s - self.last_camera_side_time) <= recovery_window_s
                 became_deeper = any((surface_m - current_surface_m) >= depth_progress_margin_m for surface_m in prior_surface_values)
                 was_near_plane = any(abs(surface_m) <= max(0.03, float(ball_radius_m) * 0.18) for surface_m in prior_surface_values)
+                approach_history_ok = recently_camera_side or became_deeper or was_near_plane
                 centroid = np.mean(goal_corners.astype(np.float32), axis=0)
                 moving_not_away = float(np.dot((p2 - p1), (centroid - p1))) > -0.35 * max(entry_speed, 1.0)
                 if current_surface_m <= 0.0:
+                    if not moving_not_away:
+                        self.last_debug_reason = "event: through-plane but moving away"
+                        return None
+                    if not approach_history_ok:
+                        self.last_debug_reason = "event: through-plane but no approach history"
+                        return None
+                    if current_surface_m <= -deep_through_threshold_m:
+                        self.last_debug_reason = "event: immediate through-plane entry"
+                        return arm_entry_confirmation(
+                            event_point_xy=center_px,
+                            event_timestamp_s=now_s,
+                            event_frame_index=frame_index,
+                            event_speed=max(entry_speed, self.pending_entry_speed),
+                            event_source="entry-through-plane-deep",
+                            event_note=f"deep through {abs(float(current_surface_m)):.2f}m",
+                        )
                     if through_count < 2:
                         self.last_debug_reason = f"event: through-plane confirm {through_count}/2"
-                    elif not moving_not_away:
-                        self.last_debug_reason = "event: through-plane but moving away"
-                    elif not (recently_camera_side or became_deeper or was_near_plane):
-                        self.last_debug_reason = "event: through-plane but no approach history"
+                        return None
                     else:
                         self.last_debug_reason = "event: delayed through-plane entry"
                         return arm_entry_confirmation(
@@ -666,6 +858,7 @@ class ImpactDetector:
                             event_timestamp_s=now_s,
                             event_frame_index=frame_index,
                             event_speed=max(entry_speed, self.pending_entry_speed),
+                            event_source="entry-delayed-through-plane",
                         )
 
         if len(self.history) < 3:
@@ -718,6 +911,9 @@ class ImpactDetector:
         ny = float(np.clip(ny, 0.0, 1.0))
         mx = nx * self.goal_width_m
         my = ny * self.goal_height_m
+        debug_source, debug_plane_state, debug_surface_signed_m, debug_plane_margin_m, debug_note = event_trigger_debug(
+            "impact-bounce",
+        )
         self.last_event_time = now_s
         self.event_latched = True
         self.history.clear()
@@ -735,4 +931,9 @@ class ImpactDetector:
             speed_before=speed_before,
             speed_after=speed_after,
             angle_change_deg=direction_change,
+            debug_source=debug_source,
+            debug_plane_state=debug_plane_state,
+            debug_surface_signed_m=debug_surface_signed_m,
+            debug_plane_margin_m=debug_plane_margin_m,
+            debug_note=debug_note,
         )
