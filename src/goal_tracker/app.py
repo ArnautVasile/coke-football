@@ -117,6 +117,25 @@ class AsyncLatestCapture:
             self._thread = None
 
 
+class RollingFpsMeter:
+    """Tracks measured loop throughput over a short rolling time window."""
+
+    def __init__(self, window_s: float = 1.0) -> None:
+        self.window_s = max(0.25, float(window_s))
+        self._sample_times_s: deque[float] = deque()
+
+    def push(self, now_s: float | None = None) -> float:
+        sample_t = time.perf_counter() if now_s is None else float(now_s)
+        self._sample_times_s.append(sample_t)
+        cutoff_t = sample_t - self.window_s
+        while len(self._sample_times_s) > 2 and self._sample_times_s[0] < cutoff_t:
+            self._sample_times_s.popleft()
+        if len(self._sample_times_s) < 2:
+            return 0.0
+        elapsed_s = max(1e-6, self._sample_times_s[-1] - self._sample_times_s[0])
+        return (len(self._sample_times_s) - 1) / elapsed_s
+
+
 def hit_zone_name(nx: float, ny: float) -> str:
     if nx < 0.33:
         col = "Left"
@@ -363,6 +382,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--impact-speed-drop-ratio", type=float, default=0.45, help="Speed-after/speed-before ratio threshold")
     parser.add_argument("--impact-dir-change", type=float, default=55.0, help="Min direction change in degrees")
     parser.add_argument("--impact-cooldown", type=float, default=0.5, help="Min seconds between hit events")
+    parser.add_argument(
+        "--impact-max-dt",
+        type=float,
+        default=0.12,
+        help="Max seconds between consecutive observations used by impact/entry logic (higher tolerates frame drops)",
+    )
     parser.add_argument("--impact-min-displacement", type=float, default=90.0, help="Min 2-frame travel (px) to allow impact")
     parser.add_argument("--impact-enable-entry", dest="impact_enable_entry", action="store_true", help="Count outside->inside goal crossing as hit event")
     parser.add_argument("--no-impact-entry", dest="impact_enable_entry", action="store_false", help="Disable outside->inside crossing events")
@@ -386,6 +411,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Require N consecutive inside-goal frames before confirming an entry; event location stays at the first inside frame",
+    )
+    parser.add_argument(
+        "--impact-entry-point-mode",
+        choices=["first", "last"],
+        default="first",
+        help="When entry confirmation spans multiple frames, use the first or last confirmed frame for hit-map location",
     )
     parser.add_argument("--impact-arm-seconds", type=float, default=1.2, help="Ignore impacts during startup/recalibration")
     parser.add_argument(
@@ -457,10 +488,34 @@ def parse_args() -> argparse.Namespace:
         help="Keep the last solved marker pose alive for this many seconds when tags momentarily disappear",
     )
     parser.add_argument(
+        "--goal-plane-depth-m",
+        type=float,
+        default=None,
+        help="Override the scoring plane depth in meters; positive values move the scoring plane farther away from the camera",
+    )
+    parser.add_argument(
         "--goal-pose-every",
         type=int,
         default=1,
         help="Solve marker-based goal pose every N frames and reuse the cached pose in between",
+    )
+    parser.add_argument(
+        "--goal-pose-every-stable",
+        type=int,
+        default=12,
+        help="After the marker pose is stable, slow re-solves to every N frames",
+    )
+    parser.add_argument(
+        "--goal-pose-stable-after",
+        type=int,
+        default=3,
+        help="Require this many consecutive successful marker solves before using the stable solve interval",
+    )
+    parser.add_argument(
+        "--goal-pose-fast-after-event-s",
+        type=float,
+        default=0.0,
+        help="Deprecated compatibility flag; event-driven marker re-solves are disabled and this value is ignored",
     )
     parser.add_argument(
         "--goal-presence-margin-px",
@@ -930,10 +985,12 @@ def create_impact_detector_for_goal(
         speed_drop_ratio=args.impact_speed_drop_ratio,
         min_direction_change_deg=args.impact_dir_change,
         cooldown_s=args.impact_cooldown,
+        max_dt_s=args.impact_max_dt,
         min_displacement_px=args.impact_min_displacement,
         enable_entry_event=args.impact_enable_entry,
         min_entry_speed_px_s=args.impact_entry_min_speed,
         entry_confirm_frames=args.impact_entry_confirm_frames,
+        entry_point_mode=args.impact_entry_point_mode,
         allow_entry_fallbacks=args.impact_entry_fallbacks,
         rearm_outside_ratio=args.impact_rearm_outside_ratio,
         rearm_camera_margin_m=args.impact_rearm_camera_margin_m,
@@ -1175,7 +1232,7 @@ def draw_overlay(
     bridge_active: bool,
     event: ImpactEvent | None,
     recent_hits: list[ImpactEvent],
-    fps: float,
+    loop_fps: float,
     adapt_conf: float,
     auto_adapt: bool,
     detector_name: str,
@@ -1196,6 +1253,7 @@ def draw_overlay(
     goal_width_m: float | None = None,
     goal_height_m: float | None = None,
     show_goal_overlay: bool = True,
+    marker_pose_enabled: bool = False,
     minimal_overlay: bool = False,
 ) -> None:
     if show_goal_overlay and not minimal_overlay:
@@ -1250,7 +1308,7 @@ def draw_overlay(
         alpha = float(np.clip(0.22 * flash_strength, 0.0, 0.22))
         cv2.addWeighted(overlay, alpha, frame_bgr, 1.0 - alpha, 0.0, frame_bgr)
 
-    cv2.putText(frame_bgr, f"FPS: {fps:5.1f}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(frame_bgr, f"Loop FPS: {loop_fps:5.1f}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     if auto_adapt:
         cv2.putText(
             frame_bgr,
@@ -1266,6 +1324,10 @@ def draw_overlay(
         key_hint = key_hint_override
     elif not show_goal_overlay and tracker_name == "none":
         key_hint = "Keys: q=quit"
+    elif marker_pose_enabled and tracker_name == "none":
+        key_hint = "Keys: c=recalibrate  g=refresh pose  q=quit"
+    elif marker_pose_enabled:
+        key_hint = "Keys: c=recalibrate  g=refresh pose  b=lock ball  x=unlock  q=quit"
     elif tracker_name == "none":
         key_hint = "Keys: c=recalibrate  q=quit"
     else:
@@ -1686,6 +1748,8 @@ def main() -> None:
         if camera_intrinsics is None:
             raise RuntimeError("Marker-based goal pose requires --camera-calibration-file.")
         goal_marker_layout = load_goal_marker_layout(layout_path)
+        if args.goal_plane_depth_m is not None:
+            goal_marker_layout.scoring_plane_depth_m = max(0.0, float(args.goal_plane_depth_m))
 
     use_undistort_input = bool(args.undistort_input)
     if goal_marker_layout is not None and use_undistort_input:
@@ -1835,12 +1899,20 @@ def main() -> None:
             f"rms={camera_intrinsics.rms_error:.4f}" if camera_intrinsics.rms_error is not None else f"[Camera] intrinsics loaded size={intrinsics_size}"
         )
     if goal_marker_layout is not None:
+        pose_every = max(1, int(args.goal_pose_every))
+        pose_every_stable = max(pose_every, int(args.goal_pose_every_stable))
+        pose_stable_after = max(1, int(args.goal_pose_stable_after))
         print(
             f"[Pose] markers active layout={args.goal_markers_layout} "
             f"outer={goal_marker_layout.goal_width_m:.2f}m x {goal_marker_layout.goal_height_m:.2f}m "
             f"opening={goal_marker_layout.opening_width_m:.2f}m x {goal_marker_layout.opening_height_m:.2f}m "
             f"depth={goal_marker_layout.scoring_plane_depth_m:.2f}m"
         )
+        print(
+            f"[Pose] cadence=every {pose_every} frame(s) until {pose_stable_after} successful solve(s), "
+            f"then every {pose_every_stable} frame(s)"
+        )
+        print("[Pose] press 'g' in the preview window to force a fresh marker pose solve")
         if args.undistort_input:
             print("[Pose] note: --undistort-input is ignored while marker-based goal pose is active.")
         if initial_pose_status is not None:
@@ -1879,8 +1951,8 @@ def main() -> None:
     if not args.no_display:
         cv2.namedWindow("Goal Impact Tracker", cv2.WINDOW_NORMAL)
     frame_idx = 0
-    last_time = time.time()
-    fps = 0.0
+    loop_fps_display = 0.0
+    loop_fps_meter = RollingFpsMeter(window_s=1.0)
     adapt_confidence = 0.0
     latest_event: ImpactEvent | None = None
     last_candidate: BallDetection | None = None
@@ -1911,6 +1983,8 @@ def main() -> None:
     stats_pose_solve_ok = 0
     stats_pose_fail_reasons: dict[str, int] = {}
     pose_fail_backoff = 1
+    pose_success_streak = 1 if initial_pose is not None else 0
+    manual_pose_refresh_requested = False
     trajectory_observations: deque[tuple[int, float, BallDetection]] = deque(maxlen=4)
     miss_candidate_active = False
     miss_candidate_started_t = 0.0
@@ -1968,9 +2042,6 @@ def main() -> None:
             add_perf_sample(perf_sums_s, "capture_preproc", time.perf_counter() - capture_t0)
 
         now = time.time()
-        dt = max(1e-6, now - last_time)
-        fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else (1.0 / dt)
-        last_time = now
         frame_idx += 1
 
         pose_t0 = time.perf_counter()
@@ -1979,12 +2050,22 @@ def main() -> None:
         pose_error_px: float | None = None
         if goal_marker_layout is not None and camera_intrinsics is not None:
             pose_every = max(1, int(args.goal_pose_every))
-            effective_pose_every = max(1, pose_every * max(1, int(pose_fail_backoff)))
+            pose_every_stable = max(pose_every, int(args.goal_pose_every_stable))
+            pose_stable_after = max(1, int(args.goal_pose_stable_after))
+            scheduled_pose_every = pose_every
+            if (
+                latest_goal_pose is not None
+                and pose_success_streak >= pose_stable_after
+            ):
+                scheduled_pose_every = pose_every_stable
+            effective_pose_every = max(1, scheduled_pose_every * max(1, int(pose_fail_backoff)))
             should_solve_pose = (
                 frame_idx <= 1
+                or manual_pose_refresh_requested
                 or (frame_idx % effective_pose_every) == 0
             )
             if should_solve_pose:
+                manual_pose_refresh_requested = False
                 stats_pose_solve_calls += 1
                 pose_solve_t0 = time.perf_counter()
                 pose_estimate, _marker_corners, _marker_ids, pose_debug = solve_goal_pose(frame, goal_marker_layout, camera_intrinsics)
@@ -1993,6 +2074,7 @@ def main() -> None:
                 if pose_estimate is not None:
                     stats_pose_solve_ok += 1
                     pose_fail_backoff = 1
+                    pose_success_streak += 1
                     latest_goal_pose = pose_estimate
                     latest_goal_pose_time = now
                     alpha = float(np.clip(args.goal_pose_alpha, 0.0, 1.0))
@@ -2001,10 +2083,12 @@ def main() -> None:
                     pose_status_label = "OK"
                     pose_error_px = pose_estimate.reprojection_error_px
                 elif latest_goal_pose is not None and (now - latest_goal_pose_time) <= max(0.0, args.goal_pose_max_age):
+                    pose_success_streak = 0
                     active_goal_pose = latest_goal_pose
                     pose_status_label = "OK"
                     pose_error_px = latest_goal_pose.reprojection_error_px
                 else:
+                    pose_success_streak = 0
                     pose_status_label = pose_debug.status
                     reason_key = str(pose_debug.status or "unknown pose solve failure").strip()
                     stats_pose_fail_reasons[reason_key] = stats_pose_fail_reasons.get(reason_key, 0) + 1
@@ -2017,6 +2101,7 @@ def main() -> None:
                 pose_status_label = "OK"
                 pose_error_px = latest_goal_pose.reprojection_error_px
             else:
+                pose_success_streak = 0
                 pose_status_label = "stale"
         elif not args.no_auto_adapt and frame_idx % max(1, args.adapt_every) == 0:
             adaptation = adapter.adapt(frame)
@@ -2456,9 +2541,17 @@ def main() -> None:
             if args.ball_only_mode:
                 key_hint_override = "Keys: space=pause/resume  n=next frame  q=quit"
             elif args.ball_tracker == "none":
-                key_hint_override = "Keys: space=pause/resume  n=next frame  c=recalibrate  q=quit"
+                key_hint_override = (
+                    "Keys: space=pause/resume  n=next frame  c=recalibrate"
+                    + ("  g=refresh pose" if goal_marker_layout is not None and camera_intrinsics is not None else "")
+                    + "  q=quit"
+                )
             else:
-                key_hint_override = "Keys: space=pause/resume  n=next  c=recalibrate  b=lock  x=unlock  q=quit"
+                key_hint_override = (
+                    "Keys: space=pause/resume  n=next  c=recalibrate"
+                    + ("  g=refresh pose" if goal_marker_layout is not None and camera_intrinsics is not None else "")
+                    + "  b=lock  x=unlock  q=quit"
+                )
 
         draw_overlay(
             frame_bgr=frame,
@@ -2473,7 +2566,7 @@ def main() -> None:
             bridge_active=bridge_ball is not None,
             event=event_for_overlay,
             recent_hits=list(recent_hits),
-            fps=fps,
+            loop_fps=loop_fps_display,
             adapt_conf=adapt_confidence,
             auto_adapt=not args.no_auto_adapt,
             detector_name=args.detector,
@@ -2494,6 +2587,7 @@ def main() -> None:
             goal_width_m=effective_goal_width_m,
             goal_height_m=effective_goal_height_m,
             show_goal_overlay=not args.ball_only_mode,
+            marker_pose_enabled=goal_marker_layout is not None and camera_intrinsics is not None,
             minimal_overlay=args.minimal_overlay,
         )
 
@@ -2586,11 +2680,16 @@ def main() -> None:
                 latest_goal_pose = None
                 latest_goal_pose_time = 0.0
                 pose_fail_backoff = 1
+                pose_success_streak = 0
+                manual_pose_refresh_requested = False
                 latest_event = None
                 last_event_seen_t = 0.0
                 recent_hits.clear()
                 flash_until = 0.0
                 impact_armed_at = time.time() + max(0.0, args.impact_arm_seconds)
+            if key == ord("g") and goal_marker_layout is not None and camera_intrinsics is not None:
+                manual_pose_refresh_requested = True
+                print("[Pose] manual marker pose solve requested")
             if video_controls_enabled and playback_paused:
                 if key in (ord("n"), ord(".")):
                     step_video_frame = True
@@ -2600,6 +2699,7 @@ def main() -> None:
         if perf_breakdown_enabled:
             add_perf_sample(perf_sums_s, "input_wait", time.perf_counter() - input_t0)
             add_perf_sample(perf_sums_s, "loop_total", time.perf_counter() - loop_perf_t0)
+        loop_fps_display = loop_fps_meter.push(time.perf_counter())
         if should_quit:
             break
 
@@ -2625,6 +2725,8 @@ def main() -> None:
                 print(
                     f"[PerfDetail] pose_solve_calls={stats_pose_solve_calls} "
                     f"pose_solve_ok={stats_pose_solve_ok} pose_every={pose_every} "
+                    f"pose_every_stable={max(pose_every, int(args.goal_pose_every_stable))} "
+                    f"pose_stable_after={max(1, int(args.goal_pose_stable_after))} "
                     f"pose_fail_backoff={pose_fail_backoff}"
                 )
                 if stats_pose_solve_calls > max(1, int(frames_done / max(1, pose_every)) + 2):

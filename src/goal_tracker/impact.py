@@ -139,6 +139,7 @@ class ImpactDetector:
         enable_entry_event: bool = True,
         min_entry_speed_px_s: float = 35.0,
         entry_confirm_frames: int = 1,
+        entry_point_mode: str = "first",
         allow_entry_fallbacks: bool = True,
         rearm_outside_ratio: float = 0.60,
         rearm_camera_margin_m: float = 0.14,
@@ -155,6 +156,8 @@ class ImpactDetector:
         self.enable_entry_event = bool(enable_entry_event)
         self.min_entry_speed_px_s = max(0.0, float(min_entry_speed_px_s))
         self.entry_confirm_frames = max(1, int(entry_confirm_frames))
+        mode = str(entry_point_mode or "first").strip().lower()
+        self.entry_point_mode = mode if mode in ("first", "last") else "first"
         self.allow_entry_fallbacks = bool(allow_entry_fallbacks)
         self.rearm_outside_ratio = max(0.10, float(rearm_outside_ratio))
         self.rearm_camera_margin_m = max(0.01, float(rearm_camera_margin_m))
@@ -179,6 +182,7 @@ class ImpactDetector:
         self.pending_entry_speed = 0.0
         self.pending_entry_last_seen_time = 0.0
         self.pending_entry_missing_grace_s = max(0.08, float(self.max_dt_s) * 2.0)
+        self.pending_entry_outside_grace_px = 10.0
 
     def reset_history(self) -> None:
         self.history.clear()
@@ -360,6 +364,15 @@ class ImpactDetector:
             # at the later rebound location.
             return default_xy
 
+        def inferred_entry_display_point(default_xy: tuple[int, int]) -> tuple[int, int]:
+            # In fallback modes we already missed the exact crossing frame, so
+            # snapping to the closest polygon edge can place the red marker at
+            # a point the ball center never visibly occupied. Prefer the current
+            # visible center when available; otherwise keep the geometric fallback.
+            if center_px is not None:
+                return center_px
+            return entry_display_point(default_xy)
+
         def emit_entry_event(
             *,
             event_point_xy: tuple[int, int],
@@ -416,10 +429,23 @@ class ImpactDetector:
 
         if self.pending_entry_active:
             if not cur_inside:
-                self._clear_pending_entry()
+                near_boundary = signed_cur >= -(radius_margin + float(self.pending_entry_outside_grace_px))
+                if near_boundary:
+                    self.pending_entry_last_seen_time = float(now_s)
+                else:
+                    self._clear_pending_entry()
             else:
                 self.pending_entry_count += 1
                 self.pending_entry_last_seen_time = float(now_s)
+                if self.entry_point_mode == "last" and center_px is not None:
+                    # Prefer a later, center-inside sample for map display when confirmation
+                    # spans multiple frames (reduces early edge-lock artifacts).
+                    center_inside_margin = max(0.0, float(radius_margin) * 0.15)
+                    if signed_cur >= -center_inside_margin:
+                        self.pending_entry_point_xy = center_px
+                        self.pending_entry_timestamp = float(now_s)
+                        self.pending_entry_frame_index = int(frame_index)
+                        self.pending_entry_speed = float(max(self.pending_entry_speed, entry_speed))
                 if self.pending_entry_count >= max(1, int(self.entry_confirm_frames)):
                     if self.pending_entry_point_xy is None:
                         self._clear_pending_entry()
@@ -466,7 +492,7 @@ class ImpactDetector:
                         return None
                     edge_point = closest_point_on_polygon(p1, poly)
                     entry_point_xy = (int(edge_point[0]), int(edge_point[1]))
-                    event_point_xy = entry_display_point(entry_point_xy)
+                    event_point_xy = inferred_entry_display_point(entry_point_xy)
                     return arm_entry_confirmation(
                         event_point_xy=event_point_xy,
                         event_timestamp_s=now_s,
@@ -500,7 +526,7 @@ class ImpactDetector:
             if near_plane_now and farther_before and moving_inward and deeper_inside:
                 edge_point = closest_point_on_polygon(p2, goal_corners.astype(np.float32))
                 entry_point_xy = (int(edge_point[0]), int(edge_point[1]))
-                event_point_xy = entry_display_point(entry_point_xy)
+                event_point_xy = inferred_entry_display_point(entry_point_xy)
                 return arm_entry_confirmation(
                     event_point_xy=event_point_xy,
                     event_timestamp_s=now_s,
@@ -535,7 +561,7 @@ class ImpactDetector:
                     else:
                         edge_point = closest_point_on_polygon(p2, goal_corners.astype(np.float32))
                         recovery_default_xy = (int(edge_point[0]), int(edge_point[1]))
-                event_point_xy = entry_display_point(recovery_default_xy)
+                event_point_xy = inferred_entry_display_point(recovery_default_xy)
                 return arm_entry_confirmation(
                     event_point_xy=event_point_xy,
                     event_timestamp_s=now_s,
