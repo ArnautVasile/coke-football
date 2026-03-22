@@ -832,11 +832,21 @@ class ImpactDetector:
                 centroid = np.mean(goal_corners.astype(np.float32), axis=0)
                 moving_not_away = float(np.dot((p2 - p1), (centroid - p1))) > -0.35 * max(entry_speed, 1.0)
                 if current_surface_m <= 0.0:
-                    if not moving_not_away:
-                        self.last_debug_reason = "event: through-plane but moving away"
-                        return None
                     if not approach_history_ok:
                         self.last_debug_reason = "event: through-plane but no approach history"
+                        return None
+                    if not moving_not_away:
+                        if self.entry_point_mode == "deepest":
+                            self.last_debug_reason = "event: deepest rebound arm"
+                            return arm_entry_confirmation(
+                                event_point_xy=center_px,
+                                event_timestamp_s=now_s,
+                                event_frame_index=frame_index,
+                                event_speed=max(entry_speed, self.pending_entry_speed),
+                                event_source="entry-through-plane-rebound",
+                                event_note="armed after rebound began",
+                            )
+                        self.last_debug_reason = "event: through-plane but moving away"
                         return None
                     if current_surface_m <= -deep_through_threshold_m:
                         self.last_debug_reason = "event: immediate through-plane entry"
