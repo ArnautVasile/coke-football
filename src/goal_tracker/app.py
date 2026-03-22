@@ -488,6 +488,18 @@ def parse_args() -> argparse.Namespace:
         help="Keep the last solved marker pose alive for this many seconds when tags momentarily disappear",
     )
     parser.add_argument(
+        "--goal-pose-settle-seconds",
+        type=float,
+        default=0.85,
+        help="Block hit/miss events for this many seconds after marker pose is reacquired or shifts significantly",
+    )
+    parser.add_argument(
+        "--goal-pose-settle-shift-px",
+        type=float,
+        default=20.0,
+        help="If a new solved marker pose moves any goal corner by at least this many pixels, temporarily block hit/miss events",
+    )
+    parser.add_argument(
         "--goal-plane-depth-m",
         type=float,
         default=None,
@@ -1248,6 +1260,7 @@ def draw_overlay(
     plane_estimate: BallPlaneEstimate | None = None,
     ball_radius_m: float | None = None,
     reject_reason: str | None = None,
+    event_debug_reason: str | None = None,
     key_hint_override: str | None = None,
     playback_status: str | None = None,
     goal_width_m: float | None = None,
@@ -1413,6 +1426,17 @@ def draw_overlay(
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
             (0, 200, 255),
+            2,
+        )
+        info_y += 24
+    if event_debug_reason:
+        cv2.putText(
+            frame_bgr,
+            event_debug_reason,
+            (20, info_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (200, 235, 255),
             2,
         )
 
@@ -1912,6 +1936,10 @@ def main() -> None:
             f"[Pose] cadence=every {pose_every} frame(s) until {pose_stable_after} successful solve(s), "
             f"then every {pose_every_stable} frame(s)"
         )
+        print(
+            f"[Pose] event holdoff={max(0.0, float(args.goal_pose_settle_seconds)):.2f}s "
+            f"after reacquire or >={max(1.0, float(args.goal_pose_settle_shift_px)):.0f}px corner shift"
+        )
         print("[Pose] press 'g' in the preview window to force a fresh marker pose solve")
         if args.undistort_input:
             print("[Pose] note: --undistort-input is ignored while marker-based goal pose is active.")
@@ -1959,8 +1987,6 @@ def main() -> None:
     last_candidate_seen_t = 0.0
     last_ball: BallDetection | None = None
     last_ball_seen_t = 0.0
-    last_plane_estimate: BallPlaneEstimate | None = None
-    last_plane_seen_t = 0.0
     last_reject_reason = ""
     last_reject_reason_t = 0.0
     track_last_center: tuple[int, int] | None = None
@@ -1985,6 +2011,7 @@ def main() -> None:
     pose_fail_backoff = 1
     pose_success_streak = 1 if initial_pose is not None else 0
     manual_pose_refresh_requested = False
+    pose_settle_until = 0.0
     trajectory_observations: deque[tuple[int, float, BallDetection]] = deque(maxlen=4)
     miss_candidate_active = False
     miss_candidate_started_t = 0.0
@@ -2068,24 +2095,55 @@ def main() -> None:
                 manual_pose_refresh_requested = False
                 stats_pose_solve_calls += 1
                 pose_solve_t0 = time.perf_counter()
+                prev_pose_success_streak = pose_success_streak
+                reference_corners = (
+                    latest_goal_pose.goal_corners_px.astype(np.float32).copy()
+                    if latest_goal_pose is not None
+                    else current_corners.astype(np.float32).copy()
+                )
                 pose_estimate, _marker_corners, _marker_ids, pose_debug = solve_goal_pose(frame, goal_marker_layout, camera_intrinsics)
                 if perf_breakdown_enabled:
                     add_perf_sample(perf_sums_s, "pose_solve_only", time.perf_counter() - pose_solve_t0)
                 if pose_estimate is not None:
                     stats_pose_solve_ok += 1
                     pose_fail_backoff = 1
+                    pose_shift_px = float(
+                        np.max(
+                            np.linalg.norm(
+                                pose_estimate.goal_corners_px.astype(np.float32) - reference_corners,
+                                axis=1,
+                            )
+                        )
+                    )
+                    pose_reacquired = (prev_pose_success_streak <= 0) or (latest_goal_pose is None)
                     pose_success_streak += 1
                     latest_goal_pose = pose_estimate
                     latest_goal_pose_time = now
                     alpha = float(np.clip(args.goal_pose_alpha, 0.0, 1.0))
                     current_corners = (1.0 - alpha) * current_corners + alpha * pose_estimate.goal_corners_px
+                    if max(0.0, float(args.goal_pose_settle_seconds)) > 0.0 and (
+                        pose_reacquired
+                        or pose_shift_px >= max(1.0, float(args.goal_pose_settle_shift_px))
+                    ):
+                        pose_settle_until = max(
+                            pose_settle_until,
+                            now + max(0.0, float(args.goal_pose_settle_seconds)),
+                        )
+                        impact_detector.reset_history()
+                        trajectory_observations.clear()
+                        miss_candidate_active = False
+                        miss_candidate_started_t = 0.0
+                        miss_candidate_last_seen_t = 0.0
+                        miss_candidate_best_surface_m = float("inf")
+                        miss_candidate_point_xy = None
+                        miss_candidate_frame_idx = 0
                     active_goal_pose = pose_estimate
                     pose_status_label = "OK"
                     pose_error_px = pose_estimate.reprojection_error_px
                 elif latest_goal_pose is not None and (now - latest_goal_pose_time) <= max(0.0, args.goal_pose_max_age):
                     pose_success_streak = 0
                     active_goal_pose = latest_goal_pose
-                    pose_status_label = "OK"
+                    pose_status_label = "cached"
                     pose_error_px = latest_goal_pose.reprojection_error_px
                 else:
                     pose_success_streak = 0
@@ -2103,6 +2161,8 @@ def main() -> None:
             else:
                 pose_success_streak = 0
                 pose_status_label = "stale"
+            if active_goal_pose is not None and now < pose_settle_until:
+                pose_status_label = "settling"
         elif not args.no_auto_adapt and frame_idx % max(1, args.adapt_every) == 0:
             adaptation = adapter.adapt(frame)
             adapt_confidence = adaptation.confidence
@@ -2310,6 +2370,7 @@ def main() -> None:
         event_ball: BallDetection | None = trusted_ball
         plane_estimate: BallPlaneEstimate | None = None
         plane_signed_distance_m: float | None = None
+        event_debug_reason = ""
         marker_pose_required_for_events = goal_marker_layout is not None and camera_intrinsics is not None
         ball_radius_m_world = max(0.01, float(args.ball_diameter_m) * 0.5)
         if not args.ball_only_mode:
@@ -2352,19 +2413,25 @@ def main() -> None:
                 )
                 if plane_estimate is not None:
                     plane_signed_distance_m = plane_estimate.signed_distance_m
-                    last_plane_estimate = plane_estimate
-                    last_plane_seen_t = now
             event_geometry_ready = True
             if marker_pose_required_for_events:
                 if active_goal_pose is None:
                     event_geometry_ready = False
                     if not detector_reject_reason:
                         detector_reject_reason = "reject: pose"
+                    event_debug_reason = "event: no pose"
                 elif event_ball is not None and plane_estimate is None:
                     event_geometry_ready = False
                     if not detector_reject_reason:
                         detector_reject_reason = "reject: plane"
-            if now >= impact_armed_at and event_geometry_ready:
+                    event_debug_reason = "event: no plane estimate"
+                elif now < pose_settle_until:
+                    event_geometry_ready = False
+                    if not detector_reject_reason:
+                        detector_reject_reason = "reject: pose settling"
+                    event_debug_reason = "event: pose settling"
+            events_armed = (now >= impact_armed_at) and event_geometry_ready
+            if events_armed:
                 event = impact_detector.update(
                     center_px=event_ball.center if event_ball else None,
                     ball_radius_px=event_ball.radius if event_ball else None,
@@ -2380,7 +2447,10 @@ def main() -> None:
                     intrinsics=camera_intrinsics,
                     frame_size=(frame.shape[1], frame.shape[0]),
                 )
-            if args.miss_detect:
+                event_debug_reason = impact_detector.get_debug_reason()
+            elif not event_debug_reason and now < impact_armed_at:
+                event_debug_reason = "event: arming"
+            if args.miss_detect and events_armed:
                 near_goal_for_miss = detection_near_goal(
                     event_ball,
                     current_corners,
@@ -2517,15 +2587,6 @@ def main() -> None:
             )
             ball_for_overlay = last_ball if (now - last_ball_seen_t) <= max(0.0, args.ball_overlay_ttl) else None
             event_for_overlay = latest_event if (now - last_event_seen_t) <= max(0.0, args.hit_overlay_ttl) else None
-            plane_estimate = (
-                plane_estimate
-                if plane_estimate is not None
-                else (
-                    last_plane_estimate
-                    if (now - last_plane_seen_t) <= max(0.0, args.ball_overlay_ttl)
-                    else None
-                )
-            )
             reject_reason_for_overlay = (
                 last_reject_reason if (now - last_reject_reason_t) <= 0.9 else ""
             )
@@ -2582,6 +2643,7 @@ def main() -> None:
             plane_estimate=plane_estimate,
             ball_radius_m=ball_radius_m_world,
             reject_reason=reject_reason_for_overlay,
+            event_debug_reason=event_debug_reason,
             key_hint_override=key_hint_override,
             playback_status=playback_status,
             goal_width_m=effective_goal_width_m,

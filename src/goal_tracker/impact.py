@@ -183,6 +183,7 @@ class ImpactDetector:
         self.pending_entry_last_seen_time = 0.0
         self.pending_entry_missing_grace_s = max(0.08, float(self.max_dt_s) * 2.0)
         self.pending_entry_outside_grace_px = 10.0
+        self.last_debug_reason = ""
 
     def reset_history(self) -> None:
         self.history.clear()
@@ -191,6 +192,7 @@ class ImpactDetector:
         self.last_camera_side_time = -1e9
         self.last_camera_side_center = None
         self._clear_pending_entry()
+        self.last_debug_reason = ""
 
     def _clear_pending_entry(self) -> None:
         self.pending_entry_active = False
@@ -200,6 +202,9 @@ class ImpactDetector:
         self.pending_entry_frame_index = 0
         self.pending_entry_speed = 0.0
         self.pending_entry_last_seen_time = 0.0
+
+    def get_debug_reason(self) -> str:
+        return self.last_debug_reason
 
     def _release_latch_if_ready(
         self,
@@ -273,6 +278,7 @@ class ImpactDetector:
         intrinsics: CameraIntrinsics | None = None,
         frame_size: tuple[int, int] | None = None,
     ) -> ImpactEvent | None:
+        self.last_debug_reason = ""
         if center_px is None:
             self._release_latch_if_ready(
                 now_s=now_s,
@@ -287,6 +293,7 @@ class ImpactDetector:
             if self.pending_entry_active:
                 if (now_s - float(self.pending_entry_last_seen_time)) > float(self.pending_entry_missing_grace_s):
                     self._clear_pending_entry()
+            self.last_debug_reason = "event: no live ball"
             return None
 
         center = np.asarray(center_px, dtype=np.float32)
@@ -303,15 +310,18 @@ class ImpactDetector:
         )
         if self.event_latched:
             self.history.append((now_s, center, plane_signed_distance_m))
+            self.last_debug_reason = "event: rearm/cooldown"
             return None
 
         self.history.append((now_s, center, plane_signed_distance_m))
         if len(self.history) < 2:
+            self.last_debug_reason = "event: need 2 samples"
             return None
 
         t1, p1, d1 = self.history[-2]
         t2, p2, d2 = self.history[-1]
         if (t2 - t1) > self.max_dt_s:
+            self.last_debug_reason = f"event: dt {(t2 - t1):.2f}s > {self.max_dt_s:.2f}s"
             return None
         d0 = self.history[-3][2] if len(self.history) >= 3 else None
 
@@ -338,6 +348,7 @@ class ImpactDetector:
                     self.last_camera_side_center = center.copy()
 
         if now_s - self.last_event_time < self.cooldown_s:
+            self.last_debug_reason = "event: cooldown"
             return None
 
         def project_event_point(point_xy: tuple[int, int]) -> tuple[float, float]:
@@ -346,6 +357,15 @@ class ImpactDetector:
                 if projected is not None:
                     return projected
             return project_to_goal(point_xy, goal_homography)
+
+        def oriented_surface_distance(signed_distance_m: float | None) -> float | None:
+            if signed_distance_m is None or camera_side_sign is None or ball_radius_m is None:
+                return None
+            oriented_center_m = float(signed_distance_m) * float(camera_side_sign)
+            return math.copysign(
+                max(0.0, abs(oriented_center_m) - float(ball_radius_m)),
+                oriented_center_m,
+            )
 
         def entry_display_point(default_xy: tuple[int, int]) -> tuple[int, int]:
             # For doorway goal-entry validation, operators expect the map/crosshair
@@ -391,6 +411,7 @@ class ImpactDetector:
             self.last_camera_side_time = -1e9
             self.last_camera_side_center = None
             self._clear_pending_entry()
+            self.last_debug_reason = "event: entry"
             return ImpactEvent(
                 timestamp=event_timestamp_s,
                 frame_index=event_frame_index,
@@ -432,8 +453,12 @@ class ImpactDetector:
                 near_boundary = signed_cur >= -(radius_margin + float(self.pending_entry_outside_grace_px))
                 if near_boundary:
                     self.pending_entry_last_seen_time = float(now_s)
+                    self.last_debug_reason = (
+                        f"event: entry confirm {self.pending_entry_count}/{max(1, int(self.entry_confirm_frames))}"
+                    )
                 else:
                     self._clear_pending_entry()
+                    self.last_debug_reason = "event: entry confirm lost"
             else:
                 self.pending_entry_count += 1
                 self.pending_entry_last_seen_time = float(now_s)
@@ -449,6 +474,7 @@ class ImpactDetector:
                 if self.pending_entry_count >= max(1, int(self.entry_confirm_frames)):
                     if self.pending_entry_point_xy is None:
                         self._clear_pending_entry()
+                        self.last_debug_reason = "event: entry confirm missing point"
                     else:
                         return emit_entry_event(
                             event_point_xy=self.pending_entry_point_xy,
@@ -457,8 +483,19 @@ class ImpactDetector:
                             event_speed=self.pending_entry_speed,
                         )
 
+                else:
+                    self.last_debug_reason = (
+                        f"event: entry confirm {self.pending_entry_count}/{max(1, int(self.entry_confirm_frames))}"
+                    )
+
+        if self.enable_entry_event and (not prev_inside) and cur_inside and entry_speed < self.min_entry_speed_px_s:
+            self.last_debug_reason = (
+                f"event: entry speed {entry_speed:.0f} < {self.min_entry_speed_px_s:.0f}"
+            )
+
         if self.enable_entry_event and (not prev_inside) and cur_inside and entry_speed >= self.min_entry_speed_px_s:
             if not self._plane_contact_ok(d1, d2, ball_radius_m, plane_contact_tolerance_m):
+                self.last_debug_reason = "event: entry plane contact"
                 return None
             entry_point = find_entry_point(p1, p2, goal_corners)
             if entry_point is None:
@@ -489,6 +526,7 @@ class ImpactDetector:
                 deeper_inside = (signed2 - signed1) >= max(0.5, self.first_inside_inward_px)
                 if moving_inward and edge_near and deeper_inside:
                     if not self._plane_contact_ok(d1, d2, ball_radius_m, plane_contact_tolerance_m):
+                        self.last_debug_reason = "event: fallback plane contact"
                         return None
                     edge_point = closest_point_on_polygon(p1, poly)
                     entry_point_xy = (int(edge_point[0]), int(edge_point[1]))
@@ -532,7 +570,7 @@ class ImpactDetector:
                     event_timestamp_s=now_s,
                     event_frame_index=frame_index,
                     event_speed=entry_speed,
-                )
+                    )
 
         # Recovery fallback for detector/pose dropouts:
         # if the exact crossing frame was missed but the ball is now clearly
@@ -567,13 +605,79 @@ class ImpactDetector:
                     event_timestamp_s=now_s,
                     event_frame_index=frame_index,
                     event_speed=entry_speed,
-                )
+                    )
+
+        # Frontal shots can travel mostly along the camera axis, then drop after
+        # net/wall contact. That can leave too little 2D bounce evidence for the
+        # old impact path even though the ball is clearly through the plane.
+        # When we see consecutive through-plane, inside-goal samples with recent
+        # depth progression, allow a short delayed entry event.
+        if (
+            self.enable_entry_event
+            and cur_inside
+            and ball_radius_m is not None
+            and camera_side_sign is not None
+            and len(self.history) >= 2
+        ):
+            depth_progress_margin_m = max(0.03, float(ball_radius_m) * 0.22)
+            recent_samples: list[tuple[float, np.ndarray, float | None]] = []
+            prev_sample_t: float | None = None
+            for sample_t, sample_center, sample_distance in reversed(self.history):
+                if prev_sample_t is not None and (prev_sample_t - sample_t) > self.max_dt_s:
+                    break
+                recent_samples.append((sample_t, sample_center, sample_distance))
+                prev_sample_t = sample_t
+                if len(recent_samples) >= 5:
+                    break
+            recent_samples.reverse()
+            current_surface_m = oriented_surface_distance(d2)
+            if len(recent_samples) >= 2 and current_surface_m is not None:
+                through_count = 0
+                for _sample_t, sample_center, sample_distance in reversed(recent_samples):
+                    sample_signed = signed_distance_to_polygon((float(sample_center[0]), float(sample_center[1])), goal_corners)
+                    sample_inside = sample_signed >= -radius_margin
+                    sample_surface_m = oriented_surface_distance(sample_distance)
+                    if sample_inside and sample_surface_m is not None and sample_surface_m <= 0.0:
+                        through_count += 1
+                    else:
+                        break
+                prior_surface_values = [
+                    surface_m
+                    for _sample_t, _sample_center, sample_distance in recent_samples[:-1]
+                    if (surface_m := oriented_surface_distance(sample_distance)) is not None
+                ]
+                recovery_window_s = max(0.60, self.max_dt_s * 10.0)
+                recently_camera_side = (now_s - self.last_camera_side_time) <= recovery_window_s
+                became_deeper = any((surface_m - current_surface_m) >= depth_progress_margin_m for surface_m in prior_surface_values)
+                was_near_plane = any(abs(surface_m) <= max(0.03, float(ball_radius_m) * 0.18) for surface_m in prior_surface_values)
+                centroid = np.mean(goal_corners.astype(np.float32), axis=0)
+                moving_not_away = float(np.dot((p2 - p1), (centroid - p1))) > -0.35 * max(entry_speed, 1.0)
+                if current_surface_m <= 0.0:
+                    if through_count < 2:
+                        self.last_debug_reason = f"event: through-plane confirm {through_count}/2"
+                    elif not moving_not_away:
+                        self.last_debug_reason = "event: through-plane but moving away"
+                    elif not (recently_camera_side or became_deeper or was_near_plane):
+                        self.last_debug_reason = "event: through-plane but no approach history"
+                    else:
+                        self.last_debug_reason = "event: delayed through-plane entry"
+                        return arm_entry_confirmation(
+                            event_point_xy=center_px,
+                            event_timestamp_s=now_s,
+                            event_frame_index=frame_index,
+                            event_speed=max(entry_speed, self.pending_entry_speed),
+                        )
 
         if len(self.history) < 3:
+            if cur_inside:
+                self.last_debug_reason = "event: inside, need 3 samples for impact"
+            else:
+                self.last_debug_reason = "event: no crossing yet"
             return None
 
         t0, p0, _d0 = self.history[-3]
         if (t1 - t0) > self.max_dt_s:
+            self.last_debug_reason = f"event: dt {(t1 - t0):.2f}s > {self.max_dt_s:.2f}s"
             return None
 
         dt0 = max(1e-4, t1 - t0)
@@ -585,17 +689,21 @@ class ImpactDetector:
         displacement = float(np.linalg.norm(p2 - p0))
 
         if displacement < self.min_displacement_px:
+            self.last_debug_reason = f"event: move {displacement:.0f}px < {self.min_displacement_px:.0f}px"
             return None
 
         if not cur_inside:
+            self.last_debug_reason = "event: outside goal opening"
             return None
 
         speed_drop = speed_before >= self.min_pre_impact_speed and speed_after <= speed_before * self.speed_drop_ratio
         direction_bounce = speed_before >= self.min_pre_impact_speed and direction_change >= self.min_direction_change_deg
         if not (speed_drop or direction_bounce):
+            self.last_debug_reason = "event: no impact bounce signature"
             return None
 
         if not self._plane_contact_ok(d1, d2, ball_radius_m, plane_contact_tolerance_m):
+            self.last_debug_reason = "event: impact plane contact"
             return None
 
         # For the live hit map/UI, use the ball center projected onto the goal
@@ -615,6 +723,7 @@ class ImpactDetector:
         self.history.clear()
         self.last_camera_side_time = -1e9
         self.last_camera_side_center = None
+        self.last_debug_reason = "event: impact"
 
         return ImpactEvent(
             timestamp=now_s,
