@@ -1,9 +1,0 @@
-# ByteTrack tuned for a single custom ball on a mostly static camera.
-# Keeps weak detections alive longer so short blur/motion dips don't immediately drop the ball.
-tracker_type: bytetrack
-track_high_thresh: 0.12
-track_low_thresh: 0.05
-new_track_thresh: 0.12
-track_buffer: 18
-match_thresh: 0.82
-fuse_score: True

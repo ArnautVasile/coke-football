@@ -28,7 +28,9 @@ data/logs/*.sqlite3
 data/logs/*.sqlite3-*
 data/logs/*.jsonl
 data/benchmarks/*.json
+data/benchmarks/*.csv
 data/metrics/*.json
+data/metrics/*.csv
 
 # Raw capture media and temporary smoke frames (very large)
 data/identity/raw_video/

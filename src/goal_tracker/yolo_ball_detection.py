@@ -90,7 +90,7 @@ def _validate_model_reference(model_path: str) -> None:
     if looks_like_filesystem_path and not path.exists():
         raise RuntimeError(
             f"YOLO model file not found: {path}. Use the real path printed after training/export, for example "
-            f"'/Users/arnautvasile/Projects/ogilvy/coke-football/runs/custom_ball/ball_yolo26s/weights/best.onnx'."
+            f"'runs/custom_ball/ball_yolo26s_identitymix_v2/weights/best.onnx'."
         )
 
 
