@@ -29,7 +29,7 @@ It also includes camera-shift adaptation so small camera movement can still work
 
 ## Client Deployment Summary
 
-For a shorter client-facing handoff document, see [CLIENT_SETUP.md](CLIENT_SETUP.md).
+Before deployment, please read [CLIENT_SETUP.md](CLIENT_SETUP.md).
 
 Recommended camera:
 
@@ -780,6 +780,7 @@ This creates:
 - `data/calibration/goal_markers_layout.png`: placement diagram for the frame
 - `data/calibration/goal_markers_layout.json`: marker IDs and real-world positions
 - `data/calibration/goal_markers/`: individual marker PNGs
+- `data/calibration/goal_markers_pages/`: printable per-page marker references
 
 Default layout:
 
@@ -909,7 +910,7 @@ python run.py \
   --stats-every 90
 ```
 
-This command is intended as a tested reference, not a universal preset. Replace the model and calibration file paths if your deployment uses different files.
+This command is intended as a tested reference, not a universal preset. Replace the model and calibration file paths if your deployment uses different files. For deployment-specific guidance, required printable assets, and the recommended model comparison workflow, see [CLIENT_SETUP.md](CLIENT_SETUP.md).
 
 Parameter notes for this reference command:
 

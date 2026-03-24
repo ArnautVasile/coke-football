@@ -89,6 +89,7 @@ Common files used in the tested setup:
 - camera intrinsics: `data/calibration/camera_intrinsics_cam_front_1.json`
 - goal marker layout: `data/calibration/goal_markers_layout_cola_zone_209x156.json`
 - tested detector model: `runs/custom_ball/ball_yolo26s_identitymix_v2/weights/best.onnx`
+- additional model to test: `runs/custom_ball/ball_yolo26s_identitymix_v2_fast/weights/best.onnx`
 
 Printable assets:
 
@@ -96,6 +97,10 @@ Printable assets:
 - ChArUco board spec: `data/calibration/charuco_board.json`
 - goal marker sheet: `data/calibration/goal_markers_sheet.png`
 - goal marker placement diagram: `data/calibration/goal_markers_layout.png`
+- goal marker print reference pages:
+  - `data/calibration/goal_markers_pages/goal_markers_page_1.png`
+  - `data/calibration/goal_markers_pages/goal_markers_page_2.png`
+  - `data/calibration/goal_markers_pages/goal_markers_page_3.png`
 
 ## Installation
 
@@ -219,6 +224,12 @@ python run.py \
   --stats-every 90
 ```
 
+Additional model to test:
+
+- `runs/custom_ball/ball_yolo26s_identitymix_v2_fast/weights/best.onnx`
+- This is a recommended alternative model to test during deployment comparison
+- If both models are available, compare them on the real installation and keep the one with the better balance of reliability and speed
+
 ## Most Important Parameters
 
 - `--impact-entry-point-mode deepest`
@@ -240,6 +251,28 @@ python run.py \
 - If the marker overlay drifts or becomes unreliable, refresh or recalibrate before continuing
 - Good lighting and low motion blur have a major effect on reliability
 - The camera should stay fixed during operation
+
+## If Retraining Is Needed
+
+If the system shows too many false positives in the real installation, retraining may be required.
+
+Recommended order:
+
+1. First test the two available detector models:
+   - `runs/custom_ball/ball_yolo26s_identitymix_v2/weights/best.onnx`
+   - `runs/custom_ball/ball_yolo26s_identitymix_v2_fast/weights/best.onnx`
+2. If false positives are still high, retrain the detector on footage from the real installation:
+   - use the same camera
+   - use the real ball
+   - capture real lighting and background conditions
+3. Evaluate the retrained detector on unseen validation footage from the same installation
+4. If false positives are still a problem after detector retraining, train and enable the exact-ball verifier as a second-stage filter
+
+In short:
+
+- first try the current tested models
+- then retrain the detector if needed
+- then add the verifier only if false positives still remain
 
 ## Recommended Client Handover
 
