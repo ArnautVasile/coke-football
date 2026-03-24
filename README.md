@@ -29,7 +29,7 @@ It also includes camera-shift adaptation so small camera movement can still work
 
 ## Client Deployment Summary
 
-If you need a shorter client-facing handoff document, use [CLIENT_SETUP.md](CLIENT_SETUP.md).
+For a shorter client-facing handoff document, see [CLIENT_SETUP.md](CLIENT_SETUP.md).
 
 Recommended camera:
 

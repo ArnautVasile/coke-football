@@ -2,7 +2,7 @@
 
 This guide is the client-facing setup and operation reference for the goal impact tracking system.
 
-For deeper engineering details, model export notes, or training workflows, see [README.md](README.md).
+If you need the full technical documentation, model export notes, or training workflows, see [README.md](README.md).
 
 ## System Purpose
 
